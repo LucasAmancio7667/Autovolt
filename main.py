@@ -2,6 +2,7 @@ import functions_framework
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.filterwarnings("ignore", module="google.cloud.bigquery")
+# Sincronizacao GitHub OK
 
 import time
 import random
