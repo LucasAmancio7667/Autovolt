@@ -171,7 +171,7 @@ def verificar_e_criar_arquivos_base():
 def obter_max_id_hibrido(client, tabela, coluna, prefixo, arquivo_csv):
     max_val = 0
     try:
-        q = f"SELECT MAX(CAST(REGEXP_EXTRACT({coluna}, r'{prefixo}(\d+)') AS INT64)) FROM `{PROJECT_ID}.{DATASET_ID}.{tabela}`"
+        q = f"SELECT MAX(CAST(REGEXP_EXTRACT({coluna}, r'{prefixo}(\\d+)') AS INT64)) FROM `{PROJECT_ID}.{DATASET_ID}.{tabela}`"
         r = list(client.query(q).result())
         if r and r[0][0]: max_val = int(r[0][0])
     except: pass
