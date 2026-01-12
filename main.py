@@ -100,8 +100,6 @@ def gerar_dimensao_tempo():
                 "ano_mes_label": f"{meses_abbr[mes]}/{str(ano)[2:]}"
             })
     return dados
-    
-
 
 # --- AUTO-CURA (CSVs LOCAIS) ---
 def verificar_e_criar_arquivos_base():
@@ -347,7 +345,7 @@ def gerar_producao(data_sim):
         if temp > 95.0:
             alerta = {"evento": "ALERTA_MAQUINA", "tipo": "SUPERAQUECIMENTO", "maquina": mid, "temp": temp, "msg": "CRITICO: Maquina superaquecida!"}
             logging.error(str(alerta)) # Log como ERRO para o Monitoring pegar
-            registrar_alerta_bq(bigquery.Client(project=PROJECT_ID), alerta)
+            registrar_alerta_bq(bigquery.Client(), alerta)
         elif vib > 2200:
             logging.warning(f"ALERTA_VIBRACAO: Maquina {mid} vibrando muito ({vib} RPM)")
         # -------------------------------------------
@@ -441,7 +439,7 @@ def executar_simulacao(request):
     atualizar_clientes_pos_simulacao(client)
     
     return f"Simulação concluída, Calendário checado e Alertas de Logs disparados (se houver)!"
-
+    
 # --- FUNÇÃO NOVA: ENVIAR PARA PAINEL ANDON (TV) ---
 def registrar_alerta_bq(client, alerta):
     try:
