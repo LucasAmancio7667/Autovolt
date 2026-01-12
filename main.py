@@ -443,5 +443,3 @@ def executar_simulacao(request):
     
     return f"Simulação concluída, Calendário checado e Alertas de Logs disparados (se houver)!"
     
-# --- TRUQUE PARA O CLOUD RUN ACHAR O APP ---
-app = executar_simulacao
