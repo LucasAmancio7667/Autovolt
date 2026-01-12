@@ -6,19 +6,24 @@ warnings.filterwarnings("ignore", module="google.cloud.bigquery")
 import time
 import random
 import os
+import logging
+import json
 import pandas as pd
 from datetime import datetime, timedelta
 from google.cloud import bigquery
 from google.cloud.bigquery import SchemaField
 from google.api_core.exceptions import NotFound
 
-# --- CONFIGURAÇÃO ---
-# (Na nuvem, a autenticação é automática, não precisa de json local)
+# --- CONFIGURAÇÃO DE LOGS ---
+# Configura o logger para capturar eventos para o Cloud Logging
+logging.basicConfig(level=logging.INFO)
+
+# --- CONFIGURAÇÃO DO PROJETO ---
 PROJECT_ID = "autovolt-analytics-479417"
 DATASET_ID = "autovolt_bronze"
-HORAS_POR_LOTE = 24  # O Robô vai simular 24h de trabalho a cada execução
+HORAS_POR_LOTE = 24  
 
-# --- SCHEMAS (COMPLETOS) ---
+# --- SCHEMAS ---
 SCHEMAS = {
     "raw_linha": [SchemaField("linha_id", "STRING"), SchemaField("descricao", "STRING"), SchemaField("turnos_operacionais", "STRING")],
     "raw_metas_vendas": [SchemaField("meta_id", "STRING"), SchemaField("ano_mes_id", "STRING"), SchemaField("meta_quantidade", "STRING"), SchemaField("meta_valor", "STRING")],
@@ -38,10 +43,38 @@ SCHEMAS = {
     "raw_compras": [SchemaField("compra_id", "STRING"), SchemaField("fornecedor_id", "STRING"), SchemaField("materia_prima_id", "STRING"), SchemaField("data_compra", "STRING"), SchemaField("quantidade_comprada", "STRING"), SchemaField("custo_unitario", "STRING"), SchemaField("custo_total", "STRING")],
     "raw_vendas": [SchemaField("venda_id", "STRING"), SchemaField("ano_mes_id", "STRING"), SchemaField("cliente_id", "STRING"), SchemaField("produto_id", "STRING"), SchemaField("ordem_producao_id", "STRING"), SchemaField("data_venda", "STRING"), SchemaField("quantidade_vendida", "STRING"), SchemaField("valor_total_venda", "STRING")],
     "raw_garantia": [SchemaField("garantia_id", "STRING"), SchemaField("cliente_id", "STRING"), SchemaField("produto_id", "STRING"), SchemaField("lote_id", "STRING"), SchemaField("data_reclamacao", "STRING"), SchemaField("dias_pos_venda", "STRING"), SchemaField("defeito_id", "STRING"), SchemaField("status", "STRING"), SchemaField("tempo_resposta_dias", "STRING"), SchemaField("custo_garantia", "STRING")],
-    "raw_manutencao": [SchemaField("evento_manutencao_id", "STRING"), SchemaField("maquina_id", "STRING"), SchemaField("linha_id", "STRING"), SchemaField("tipo_manutencao_id", "STRING"), SchemaField("inicio", "STRING"), SchemaField("fim", "STRING"), SchemaField("duracao_min", "STRING"), SchemaField("criticidade", "STRING")]
+    "raw_manutencao": [SchemaField("evento_manutencao_id", "STRING"), SchemaField("maquina_id", "STRING"), SchemaField("linha_id", "STRING"), SchemaField("tipo_manutencao_id", "STRING"), SchemaField("inicio", "STRING"), SchemaField("fim", "STRING"), SchemaField("duracao_min", "STRING"), SchemaField("criticidade", "STRING")],
+    "raw_controle_acesso": [SchemaField("email_usuario", "STRING"), SchemaField("cargo", "STRING")]
 }
 
-# --- LISTAS AUXILIARES ---
+# --- DADOS ESTÁTICOS ---
+DADOS_ESTATICOS = {
+    "raw_linha": [
+        {"linha_id": "L01", "descricao": "Linha de Montagem Automotiva (Alta Velocidade)", "turnos_operacionais": "3"},
+        {"linha_id": "L02", "descricao": "Linha de Injeção de Caixas Plásticas", "turnos_operacionais": "3"},
+        {"linha_id": "L03", "descricao": "Linha de Envase de Ácido e Carga", "turnos_operacionais": "3"},
+        {"linha_id": "L04", "descricao": "Linha de Baterias Pesadas (Caminhões/Ônibus)", "turnos_operacionais": "2"},
+        {"linha_id": "L05", "descricao": "Linha de Prototipagem e Testes Especiais", "turnos_operacionais": "1"}
+    ],
+    "raw_metas_vendas": [
+        {"meta_id": "M001", "ano_mes_id": "2025-01", "meta_quantidade": "1500", "meta_valor": "350000.00"},
+        {"meta_id": "M002", "ano_mes_id": "2025-02", "meta_quantidade": "1800", "meta_valor": "420000.00"},
+        {"meta_id": "M003", "ano_mes_id": "2025-03", "meta_quantidade": "2000", "meta_valor": "500000.00"},
+        {"meta_id": "M004", "ano_mes_id": "2025-04", "meta_quantidade": "2200", "meta_valor": "550000.00"},
+        {"meta_id": "M005", "ano_mes_id": "2025-05", "meta_quantidade": "2500", "meta_valor": "600000.00"}
+    ],
+    "raw_turno": [
+        {"turno_id": "T1", "janela": "06:00 - 14:00", "coef_performance": "1.0"},
+        {"turno_id": "T2", "janela": "14:00 - 22:00", "coef_performance": "0.95"},
+        {"turno_id": "T3", "janela": "22:00 - 06:00", "coef_performance": "0.90"}
+    ],
+    "raw_tipo_manut": [
+        {"tipo_manutencao_id": "TM01", "descricao": "Preventiva Programada", "criticidade_padrao": "Baixa"},
+        {"tipo_manutencao_id": "TM02", "descricao": "Corretiva Emergencial", "criticidade_padrao": "Alta"},
+        {"tipo_manutencao_id": "TM03", "descricao": "Preditiva (Análise de Vibração)", "criticidade_padrao": "Média"}
+    ]
+}
+
 ESTADOS_BRASIL = ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"]
 CACHE = {"CLIENTES": [], "PRODUTOS": {}, "MAQUINAS": [], "LINHAS": [], "FORNECEDORES": {}, "MATERIAS": {}, "DEFEITOS": []}
 estoque_materia_prima = []; estoque_produtos_acabados = []; historico_vendas = []
@@ -49,10 +82,29 @@ cnt_compra=0; cnt_op=0; cnt_lote=0; cnt_venda=0; cnt_garantia=0; cnt_manut=0; cn
 
 def conectar_bq(): return bigquery.Client(project=PROJECT_ID)
 
-# --- FUNÇÃO DE AUTO-CURA (RECRIA ARQUIVOS PERDIDOS) ---
-def verificar_e_criar_arquivos_base():
-    """Gera CSVs locais temporários para o script funcionar na nuvem."""
+# --- FUNÇÃO NOVA: GERAR CALENDÁRIO AUTOMÁTICO ---
+def gerar_dimensao_tempo():
+    """Gera meses de 2023 até 2026 para a tabela raw_tempo"""
+    dados = []
+    meses_pt = {1:"Janeiro", 2:"Fevereiro", 3:"Março", 4:"Abril", 5:"Maio", 6:"Junho", 7:"Julho", 8:"Agosto", 9:"Setembro", 10:"Outubro", 11:"Novembro", 12:"Dezembro"}
+    meses_abbr = {1:"jan", 2:"fev", 3:"mar", 4:"abr", 5:"mai", 6:"jun", 7:"jul", 8:"ago", 9:"set", 10:"out", 11:"nov", 12:"dez"}
     
+    for ano in range(2023, 2027):
+        for mes in range(1, 13):
+            dados.append({
+                "ano_mes_id": f"{ano}-{mes:02d}",
+                "ano": str(ano),
+                "mes": f"{mes:02d}",
+                "nome_mes": meses_pt[mes],
+                "trimestre": str((mes - 1) // 3 + 1),
+                "ano_mes_label": f"{meses_abbr[mes]}/{str(ano)[2:]}"
+            })
+    return dados
+    
+
+
+# --- AUTO-CURA (CSVs LOCAIS) ---
+def verificar_e_criar_arquivos_base():
     if not os.path.exists("raw_materia_prima.csv"):
         pd.DataFrame({
             "materia_prima_id": ["MP001", "MP002", "MP003", "MP004", "MP005"],
@@ -60,15 +112,12 @@ def verificar_e_criar_arquivos_base():
         }).to_csv("raw_materia_prima.csv", index=False)
 
     if not os.path.exists("raw_fornecedor.csv"):
-        pd.DataFrame({
-            "fornecedor_id": ["F001", "F002", "F003", "F004"],
-            "categoria": ["Chumbo/Metais", "Químicos/Ácidos", "Plásticos/Polímeros", "Componentes Elétricos"],
-            "leadtime_dias": ["5", "3", "7", "10"],
-            "qualificacao": ["A", "A", "B", "A"],
-            "data_cadastro": ["2023-01-01", "2023-02-15", "2023-03-10", "2023-05-20"],
-            "data_ultima_avaliacao": ["2024-01-01", "2024-01-01", "2024-01-01", "2024-01-01"],
-            "descricao": ["Fornecedor Global Metais", "ChemTech Ind", "PlastCorp", "ElectroParts"]
-        }).to_csv("raw_fornecedor.csv", index=False)
+        fornecedores = []
+        for i in range(1, 6): fornecedores.append(["F"+f"{i:03d}", "Chumbo/Metais", str(random.randint(5,15)), "A", "2023-01-10", "2024-01-01", f"Fornecedor Metal {i}"])
+        for i in range(6, 11): fornecedores.append(["F"+f"{i:03d}", "Químicos/Ácidos", str(random.randint(3,10)), "A", "2023-02-15", "2024-01-01", f"Indústria Química {i}"])
+        for i in range(11, 16): fornecedores.append(["F"+f"{i:03d}", "Plásticos/Polímeros", str(random.randint(7,20)), "B", "2023-03-20", "2024-01-01", f"PlastCorp {i}"])
+        for i in range(16, 21): fornecedores.append(["F"+f"{i:03d}", "Componentes Elétricos", str(random.randint(10,30)), "A", "2023-05-05", "2024-01-01", f"ElectroParts {i}"])
+        pd.DataFrame(fornecedores, columns=["fornecedor_id", "categoria", "leadtime_dias", "qualificacao", "data_cadastro", "data_ultima_avaliacao", "descricao"]).to_csv("raw_fornecedor.csv", index=False)
 
     if not os.path.exists("raw_defeito.csv"):
         pd.DataFrame({
@@ -77,37 +126,28 @@ def verificar_e_criar_arquivos_base():
             "gravidade": ["Nenhuma", "Alta", "Média", "Média", "Crítica", "Baixa"]
         }).to_csv("raw_defeito.csv", index=False)
 
-    # --- LISTA COMPLETA E CORRIGIDA (CAPACIDADE BATE COM NOME) ---
     if not os.path.exists("raw_produto.csv"):
         pd.DataFrame({
             "produto_id": ["BAT001", "BAT002", "BAT003", "BAT004", "BAT005", "BAT006", "BAT007", "BAT008", "BAT009", "BAT010"],
             "modelo": ["AV-50Ah", "AV-60Ah", "AV-70Ah", "AV-80Ah", "AV-90Ah", "AV-100Ah", "AV-110Ah", "AV-120Ah", "AV-130Ah", "AV-140Ah"],
             "tensao_v": ["12", "24", "12", "24", "48", "12", "12", "12", "12", "12"],
-            "capacidade_ah": ["50", "60", "70", "80", "90", "100", "110", "120", "130", "140"], # CORRIGIDO AQUI
+            "capacidade_ah": ["50", "60", "70", "80", "90", "100", "110", "120", "130", "140"],
             "linha_segmento": ["Montadora", "Reposição", "Montadora", "Reposição", "Montadora", "Reposição", "Montadora", "Reposição", "Reposição", "Montadora"],
             "data_lancamento": ["2024-10-21", "2025-01-19", "2025-01-22", "2024-12-20", "2024-12-14", "2024-12-13", "2025-02-17", "2025-01-16", "2025-02-16", "2024-12-18"],
             "data_descontinuacao": ["", "", "", "", "", "", "", "", "", ""]
         }).to_csv("raw_produto.csv", index=False)
 
     if not os.path.exists("raw_maquina.csv"):
-        pd.DataFrame({
-            "maquina_id": ["M001", "M002", "M003"],
-            "tipo": ["Montadora Automática", "Injetora de Plástico", "Envasadora de Ácido"],
-            "fabricante": ["Siemens", "Engel", "Bosch"],
-            "ano": ["2018", "2020", "2019"],
-            "linha_id": ["L01", "L01", "L02"]
-        }).to_csv("raw_maquina.csv", index=False)
+        maquinas = []
+        for i in range(1, 21):
+            tipo = random.choice(["Montadora Automática", "Injetora de Plástico", "Envasadora de Ácido", "Robô de Solda", "Testador de Carga"])
+            fab = random.choice(["Siemens", "Engel", "Bosch", "ABB", "Kuka"])
+            linha = f"L{random.randint(1,5):02d}"
+            maquinas.append([f"M{i:03d}", tipo, fab, str(random.randint(2015, 2024)), linha])
+        pd.DataFrame(maquinas, columns=["maquina_id", "tipo", "fabricante", "ano", "linha_id"]).to_csv("raw_maquina.csv", index=False)
     
     if not os.path.exists("raw_cliente.csv"):
-        pd.DataFrame({
-            "cliente_id": ["C001"],
-            "tipo_cliente": ["Distribuidor"],
-            "cidade": ["SP"],
-            "tipo_plano": ["Básico"],
-            "data_cadastro": ["2023-01-01"],
-            "data_ultima_compra": [""]
-        }).to_csv("raw_cliente.csv", index=False)
-
+        pd.DataFrame({"cliente_id": ["C001"], "tipo_cliente": ["Distribuidor"], "cidade": ["SP"], "tipo_plano": ["Básico"], "data_cadastro": ["2023-01-01"], "data_ultima_compra": [""]}).to_csv("raw_cliente.csv", index=False)
 
 def obter_max_id_hibrido(client, tabela, coluna, prefixo, arquivo_csv):
     max_val = 0
@@ -123,6 +163,62 @@ def calcular_turno(data_hora):
     if 6 <= h < 14: return "T1"
     elif 14 <= h < 22: return "T2"
     else: return "T3"
+
+# --- POPULADOR INTELIGENTE (ESTÁTICO + TEMPO) ---
+
+#---------------------------------------------------------------------------------------------------
+def criar_tabela_usuarios_simples(client):
+    """Versão mais simples usando WRITE_TRUNCATE"""
+    dados_usuarios = [
+        {"email_usuario": "jam4@discente.ifpe.edu.br", "cargo": "DIRETORIA"},
+        {"email_usuario": "adventuregamesbr123@gmail.com", "cargo": "DIRETORIA"},
+        {"email_usuario": "juliosicesar5@gmail.com", "cargo": "DIRETORIA"},
+        {"email_usuario": "pedrohenriquereisxavier@gmail.com", "cargo": "DIRETORIA"},
+        {"email_usuario": "fcss1@discente.ifpe.edu.br", "cargo": "DIRETORIA"},
+        {"email_usuario": "coordenador_compras@empresa.com", "cargo": "SUPRIMENTOS"},
+        {"email_usuario": "gerente_planta@empresa.com", "cargo": "INDUSTRIAL"},
+        {"email_usuario": "gerente_vendas@empresa.com", "cargo": "COMERCIAL"},
+        {"email_usuario": "engenheiro_qualidade@empresa.com", "cargo": "QUALIDADE"}
+    ]
+    
+    df = pd.DataFrame(dados_usuarios).astype(str).replace("None", "").replace("nan", "")
+    
+    # WRITE_TRUNCATE apaga tudo e recria
+    job_config = bigquery.LoadJobConfig(
+        write_disposition="WRITE_TRUNCATE",
+        create_disposition="CREATE_IF_NEEDED"
+    )
+    
+    client.load_table_from_dataframe(
+        df, 
+        client.dataset(DATASET_ID).table("raw_controle_acesso"), 
+        job_config=job_config
+    ).result()
+    
+    print("✅ Tabela raw_controle_acesso criada/atualizada")
+#---------------------------------------------------------------------------------------------------
+
+def popular_tabelas_estaticas(client):
+    print("🚦 Verificando Tabelas Estáticas...")
+    
+    # 1. Tabelas Fixas (Dicionário)
+    for tabela, dados in DADOS_ESTATICOS.items():
+        try:
+            res = list(client.query(f"SELECT COUNT(*) FROM `{PROJECT_ID}.{DATASET_ID}.{tabela}`").result())
+            if res[0][0] == 0:
+                print(f"   ⚠️ Populando {tabela}...")
+                client.load_table_from_dataframe(pd.DataFrame(dados), client.dataset(DATASET_ID).table(tabela), job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")).result()
+        except Exception as e: print(f"❌ Erro {tabela}: {e}")
+
+    # 2. Tabela de Tempo (Gerada Matematicamente)
+    try:
+        res = list(client.query(f"SELECT COUNT(*) FROM `{PROJECT_ID}.{DATASET_ID}.raw_tempo`").result())
+        if res[0][0] == 0:
+            print("   ⚠️ Populando raw_tempo (Calendário)...")
+            dados_tempo = gerar_dimensao_tempo()
+            client.load_table_from_dataframe(pd.DataFrame(dados_tempo), client.dataset(DATASET_ID).table("raw_tempo"), job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")).result()
+            print("   ✅ raw_tempo criada!")
+    except Exception as e: print(f"❌ Erro raw_tempo: {e}")
 
 def inicializar_ambiente(client):
     global cnt_compra, cnt_op, cnt_lote, cnt_venda, cnt_garantia, cnt_manut, cnt_cliente, CACHE
@@ -145,6 +241,11 @@ def inicializar_ambiente(client):
                     client.load_table_from_dataframe(df, ref, job_config=job_config).result()
                 except: pass
 
+    # CHAMA A POPULAÇÃO AUTOMÁTICA
+    criar_tabela_usuarios_simples(client)
+
+    popular_tabelas_estaticas(client)
+
     cnt_compra = obter_max_id_hibrido(client, "raw_compras", "compra_id", "C", "raw_compras.csv")
     cnt_op = obter_max_id_hibrido(client, "raw_producao", "ordem_producao_id", "OP", "raw_producao.csv")
     cnt_lote = obter_max_id_hibrido(client, "raw_lote", "lote_id", "Lote", "raw_lote.csv")
@@ -160,29 +261,47 @@ def inicializar_ambiente(client):
         df_f = pd.read_csv("raw_fornecedor.csv"); CACHE["FORNECEDORES"] = df_f.groupby('categoria')['fornecedor_id'].apply(list).to_dict()
         df_mp = pd.read_csv("raw_materia_prima.csv"); CACHE["MATERIAS"] = df_mp.set_index('materia_prima_id')['nome_material'].to_dict()
         CACHE["DEFEITOS"] = pd.read_csv("raw_defeito.csv")['defeito_id'].tolist()
-    except:
-        CACHE["CLIENTES"] = ["C001"]
+    except: CACHE["CLIENTES"] = ["C001"]
+
+    # ---------------------------------------------------------
+    # NOVO BLOCO: Sincronização da Tabela de Segurança (Lookup)
+    # ---------------------------------------------------------
+    print("🔒 Sincronizando tabela técnica de Lookup (Security)...")
+    
+    # Define o dataset silver trocando o nome, já que o DATASET_ID é bronze
+    dataset_silver = DATASET_ID.replace("bronze", "silver")
+    
+    # Esta query apaga a lookup antiga e cria uma nova baseada na raw_controle_acesso
+    query_sync_lookup = f"""
+    CREATE OR REPLACE TABLE `{PROJECT_ID}.{dataset_silver}.sys_acessos_lookup` AS
+    SELECT DISTINCT
+        email_usuario,
+        cargo
+    FROM `{PROJECT_ID}.{DATASET_ID}.raw_controle_acesso`
+    WHERE email_usuario IS NOT NULL
+    """
+    
+    try:
+        client.query(query_sync_lookup).result() # O .result() força o Python a esperar terminar
+        print("   ✅ Tabela sys_acessos_lookup atualizada com sucesso.")
+    except Exception as e:
+        print(f"   ❌ ERRO CRÍTICO: Falha ao atualizar Lookup de Segurança: {e}")
+
 
 def enviar_bq(client, dados, tabela):
     if not dados: return
     try:
         df = pd.DataFrame(dados).astype(str).replace("None", "").replace("nan", "")
-        table_ref = client.dataset(DATASET_ID).table(tabela)
-        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
-        client.load_table_from_dataframe(df, table_ref, job_config=job_config).result()
+        client.load_table_from_dataframe(df, client.dataset(DATASET_ID).table(tabela), job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")).result()
     except Exception as e: print(f"Erro {tabela}: {e}")
 
-# --- GERADORES COMPLEXOS (MANTIDOS) ---
+# --- GERADORES ---
 def gerar_novos_clientes(data_sim):
     global cnt_cliente, CACHE; dados = []
     if random.random() < 0.05: 
         cnt_cliente += 1; nid = f"C{cnt_cliente:04d}"
         plano = random.choices(["Básico", "Intermediário", "Estendido", "Premium"], weights=[40, 30, 20, 10], k=1)[0]
-        cli = {
-            "cliente_id": nid, "tipo_cliente": random.choice(["Montadora", "Distribuidor", "Autopeças"]),
-            "cidade": random.choice(ESTADOS_BRASIL), "tipo_plano": plano,
-            "data_cadastro": data_sim.strftime("%Y-%m-%d"), "data_ultima_compra": ""
-        }
+        cli = {"cliente_id": nid, "tipo_cliente": random.choice(["Montadora", "Distribuidor", "Autopeças"]), "cidade": random.choice(ESTADOS_BRASIL), "tipo_plano": plano, "data_cadastro": data_sim.strftime("%Y-%m-%d"), "data_ultima_compra": ""}
         dados.append(cli); CACHE["CLIENTES"].append(nid)
     return dados
 
@@ -195,11 +314,7 @@ def gerar_compras(data_sim, forcar_compra=False):
             cnt_compra += 1; cid = f"C{cnt_compra}"
             mp_id = random.choice(list(CACHE["MATERIAS"].keys()))
             fornecedores_validos = [f for sublist in CACHE["FORNECEDORES"].values() for f in sublist] or ["F001"]
-            item = {
-                "compra_id": cid, "fornecedor_id": random.choice(fornecedores_validos), "materia_prima_id": mp_id,
-                "data_compra": data_sim.strftime("%Y-%m-%d %H:%M:%S"), "quantidade_comprada": random.randint(500, 2000),
-                "custo_unitario": round(random.uniform(20, 100), 2), "custo_total": 0
-            }
+            item = {"compra_id": cid, "fornecedor_id": random.choice(fornecedores_validos), "materia_prima_id": mp_id, "data_compra": data_sim.strftime("%Y-%m-%d %H:%M:%S"), "quantidade_comprada": random.randint(500, 2000), "custo_unitario": round(random.uniform(20, 100), 2), "custo_total": 0}
             item["custo_total"] = round(item["quantidade_comprada"] * item["custo_unitario"], 2)
             dados.append(item); estoque_materia_prima.append({"id": cid, "mp": mp_id})
     return dados
@@ -227,16 +342,29 @@ def gerar_producao(data_sim):
         d_dim.append({"lote_id": lid, "produto_id": pid, "linha_id": random.choice(linhas_lista), "maquina_id": mid, "inicio_producao": ini.strftime("%Y-%m-%d %H:%M:%S"), "fim_producao": fim.strftime("%Y-%m-%d %H:%M:%S"), "duracao_horas": dur})
         q_plan = random.choice([100,200]); q_prod = int(q_plan*random.uniform(0.9,1.0))
         d_fact.append({"ordem_producao_id": op_id, "lote_id": lid, "produto_id": pid, "linha_id": d_dim[-1]["linha_id"], "maquina_id": mid, "turno_id": calcular_turno(data_sim), "inicio": ini.strftime("%Y-%m-%d %H:%M:%S"), "temperatura_media_c": temp, "vibracao_media_rpm": vib, "pressao_media_bar": pres, "ciclo_minuto_nominal": 5.0, "duracao_horas": dur, "quantidade_planejada": q_plan, "quantidade_produzida": q_prod, "quantidade_refugada": q_plan-q_prod})
-        
+
+        # --- MONITORAMENTO: ALERTA DE LOG (NOVO) ---
+        if temp > 95.0:
+            alerta = {"evento": "ALERTA_MAQUINA", "tipo": "SUPERAQUECIMENTO", "maquina": mid, "temp": temp, "msg": "CRITICO: Maquina superaquecida!"}
+            logging.error(str(alerta)) # Log como ERRO para o Monitoring pegar
+            registrar_alerta_bq(bigquery.Client(project=PROJECT_ID), alerta)
+        elif vib > 2200:
+            logging.warning(f"ALERTA_VIBRACAO: Maquina {mid} vibrando muito ({vib} RPM)")
+        # -------------------------------------------
+
         insumos = random.sample(estoque_materia_prima, k=min(len(estoque_materia_prima), 2))
         for ins in insumos: d_map.append({"lote_id": lid, "compra_id": ins["id"]})
-        
         tem_def=False; d_real="D00"
-        if random.random() < fator_defeito: 
-            tem_def=True; d_real = "D04" if esta_em_surto else random.choice(defeitos_lista)
+        if random.random() < fator_defeito: tem_def=True; d_real = "D04" if esta_em_surto else random.choice(defeitos_lista)
         aprovado=1; d_rep="D00"
         if tem_def and random.random()>0.1: aprovado=0; d_rep=d_real
+        
         d_qual.append({"teste_id": f"T{cnt_lote}", "lote_id": lid, "produto_id": pid, "data_teste": (fim+timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"), "tensao_medida_v": 10.5 if tem_def else 12.6, "resistencia_interna_mohm": 8.0 if tem_def else 6.0, "capacidade_ah_teste": 60.0, "defeito_id": d_rep, "aprovado": aprovado})
+        
+        # --- MONITORAMENTO: QUALIDADE ---
+        if aprovado == 0:
+            logging.warning(f"ALERTA_QUALIDADE: Lote {lid} reprovado por defeito {d_rep}")
+
         if aprovado==1: estoque_produtos_acabados.append({"lote_id": lid, "produto_id": pid, "op_id": op_id, "def": d_real if tem_def else None})
     return d_fact, d_dim, d_map, d_qual
 
@@ -276,16 +404,20 @@ def gerar_manutencao(data_sim):
         dados.append({"evento_manutencao_id": f"EVM{cnt_manut}", "maquina_id": random.choice(maquinas_lista), "linha_id": random.choice(linhas_lista), "tipo_manutencao_id": "TM01", "inicio": ini.strftime("%Y-%m-%d %H:%M:%S"), "fim": fim.strftime("%Y-%m-%d %H:%M:%S"), "duracao_min": 120, "criticidade": "Média"})
     return dados
 
+def atualizar_clientes_pos_simulacao(client):
+    print("🔨 Atualizando Data da Última Compra dos Clientes...")
+    try: client.query(f"UPDATE `{PROJECT_ID}.{DATASET_ID}.raw_cliente` c SET data_ultima_compra = (SELECT CAST(MAX(data_venda) AS STRING) FROM `{PROJECT_ID}.{DATASET_ID}.raw_vendas` v WHERE v.cliente_id = c.cliente_id) WHERE TRUE").result()
+    except Exception as e: print(f"⚠️ Erro ao atualizar clientes: {e}")
+
 @functions_framework.http
 def executar_simulacao(request):
-    print("🚀 Simulador V22 (CLOUD TRIGGER)...")
+    print("🚀 Simulador V27 (COM MONITORAMENTO DE LOGS)...")
     client = conectar_bq(); inicializar_ambiente(client)
     
     enviar_bq(client, gerar_compras(datetime.now() - timedelta(days=1), forcar_compra=True), "raw_compras")
     data_sim = datetime.now()
     b_cli=[]; b_comp=[]; b_prod=[]; b_lote=[]; b_map=[]; b_qual=[]; b_vend=[]; b_gar=[]; b_man=[]
 
-    # Executa apenas 1 ciclo de HORAS_POR_LOTE para não estourar timeout
     for _ in range(HORAS_POR_LOTE):
         data_sim += timedelta(hours=1)
         b_cli.extend(gerar_novos_clientes(data_sim))
@@ -306,4 +438,28 @@ def executar_simulacao(request):
     enviar_bq(client, b_gar, "raw_garantia")
     enviar_bq(client, b_man, "raw_manutencao")
     
-    return f"Simulação concluída com sucesso. {HORAS_POR_LOTE} horas geradas com lógica COMPLETA."
+    atualizar_clientes_pos_simulacao(client)
+    
+    return f"Simulação concluída, Calendário checado e Alertas de Logs disparados (se houver)!"
+
+# --- FUNÇÃO NOVA: ENVIAR PARA PAINEL ANDON (TV) ---
+def registrar_alerta_bq(client, alerta):
+    try:
+        # Tenta pegar as variaveis globais PROJECT_ID e DATASET_ID que devem estar definidas no inicio do seu script
+        # Se nao tiver, define aqui como garantia:
+        proj = "autovolt-analytics-479417"
+        data = "autovolt_bronze"
+        
+        row = {
+            "alerta_id": f"ALT-{int(time.time())}",
+            "data_ocorrencia": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "nivel": "CRITICO",
+            "maquina_id": str(alerta.get("maquina", "M000")),
+            "mensagem": str(alerta.get("msg", "ERRO CRITICO")),
+            "valor_medido": float(alerta.get("temp", 0.0))
+        }
+        # Insere direto na tabela de alertas
+        client.insert_rows_json(f"{proj}.{data}.monitoramento_alertas", [row])
+        logging.info("Alerta enviado para Painel TV BigQuery")
+    except Exception as e:
+        logging.error(f"Erro ao atualizar Painel TV: {e}")
