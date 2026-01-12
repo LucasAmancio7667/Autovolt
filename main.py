@@ -2,7 +2,6 @@ import functions_framework
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.filterwarnings("ignore", module="google.cloud.bigquery")
-# Sincronizacao GitHub OK
 
 import time
 import random
@@ -16,7 +15,6 @@ from google.cloud.bigquery import SchemaField
 from google.api_core.exceptions import NotFound
 
 # --- CONFIGURAÇÃO DE LOGS ---
-# Configura o logger para capturar eventos para o Cloud Logging
 logging.basicConfig(level=logging.INFO)
 
 # --- CONFIGURAÇÃO DO PROJETO ---
@@ -45,7 +43,8 @@ SCHEMAS = {
     "raw_vendas": [SchemaField("venda_id", "STRING"), SchemaField("ano_mes_id", "STRING"), SchemaField("cliente_id", "STRING"), SchemaField("produto_id", "STRING"), SchemaField("ordem_producao_id", "STRING"), SchemaField("data_venda", "STRING"), SchemaField("quantidade_vendida", "STRING"), SchemaField("valor_total_venda", "STRING")],
     "raw_garantia": [SchemaField("garantia_id", "STRING"), SchemaField("cliente_id", "STRING"), SchemaField("produto_id", "STRING"), SchemaField("lote_id", "STRING"), SchemaField("data_reclamacao", "STRING"), SchemaField("dias_pos_venda", "STRING"), SchemaField("defeito_id", "STRING"), SchemaField("status", "STRING"), SchemaField("tempo_resposta_dias", "STRING"), SchemaField("custo_garantia", "STRING")],
     "raw_manutencao": [SchemaField("evento_manutencao_id", "STRING"), SchemaField("maquina_id", "STRING"), SchemaField("linha_id", "STRING"), SchemaField("tipo_manutencao_id", "STRING"), SchemaField("inicio", "STRING"), SchemaField("fim", "STRING"), SchemaField("duracao_min", "STRING"), SchemaField("criticidade", "STRING")],
-    "raw_controle_acesso": [SchemaField("email_usuario", "STRING"), SchemaField("cargo", "STRING")]
+    "raw_controle_acesso": [SchemaField("email_usuario", "STRING"), SchemaField("cargo", "STRING")],
+    "monitoramento_alertas": [SchemaField("alerta_id", "STRING"), SchemaField("data_ocorrencia", "TIMESTAMP"), SchemaField("nivel", "STRING"), SchemaField("maquina_id", "STRING"), SchemaField("mensagem", "STRING"), SchemaField("valor_medido", "FLOAT64")]
 }
 
 # --- DADOS ESTÁTICOS ---
@@ -81,11 +80,32 @@ CACHE = {"CLIENTES": [], "PRODUTOS": {}, "MAQUINAS": [], "LINHAS": [], "FORNECED
 estoque_materia_prima = []; estoque_produtos_acabados = []; historico_vendas = []
 cnt_compra=0; cnt_op=0; cnt_lote=0; cnt_venda=0; cnt_garantia=0; cnt_manut=0; cnt_cliente=0
 
+# --- FUNÇÃO NOVA: ENVIAR PARA PAINEL ANDON (TV) ---
+# Movi para cima para evitar erros de referência
+def registrar_alerta_bq(client, alerta):
+    try:
+        row = {
+            "alerta_id": f"ALT-{int(time.time())}",
+            "data_ocorrencia": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "nivel": "CRITICO",
+            "maquina_id": str(alerta.get("maquina", "M000")),
+            "mensagem": str(alerta.get("msg", "ERRO CRITICO")),
+            "valor_medido": float(alerta.get("temp", 0.0))
+        }
+        # Insere direto na tabela de alertas
+        table_ref = f"{PROJECT_ID}.{DATASET_ID}.monitoramento_alertas"
+        errors = client.insert_rows_json(table_ref, [row])
+        if errors:
+            logging.error(f"Erros BQ: {errors}")
+        else:
+            logging.info("Alerta enviado para Painel TV BigQuery")
+    except Exception as e:
+        logging.error(f"Erro ao atualizar Painel TV: {e}")
+
 def conectar_bq(): return bigquery.Client(project=PROJECT_ID)
 
-# --- FUNÇÃO NOVA: GERAR CALENDÁRIO AUTOMÁTICO ---
+# --- GERAR CALENDÁRIO AUTOMÁTICO ---
 def gerar_dimensao_tempo():
-    """Gera meses de 2023 até 2026 para a tabela raw_tempo"""
     dados = []
     meses_pt = {1:"Janeiro", 2:"Fevereiro", 3:"Março", 4:"Abril", 5:"Maio", 6:"Junho", 7:"Julho", 8:"Agosto", 9:"Setembro", 10:"Outubro", 11:"Novembro", 12:"Dezembro"}
     meses_abbr = {1:"jan", 2:"fev", 3:"mar", 4:"abr", 5:"mai", 6:"jun", 7:"jul", 8:"ago", 9:"set", 10:"out", 11:"nov", 12:"dez"}
@@ -165,9 +185,7 @@ def calcular_turno(data_hora):
 
 # --- POPULADOR INTELIGENTE (ESTÁTICO + TEMPO) ---
 
-#---------------------------------------------------------------------------------------------------
 def criar_tabela_usuarios_simples(client):
-    """Versão mais simples usando WRITE_TRUNCATE"""
     dados_usuarios = [
         {"email_usuario": "jam4@discente.ifpe.edu.br", "cargo": "DIRETORIA"},
         {"email_usuario": "adventuregamesbr123@gmail.com", "cargo": "DIRETORIA"},
@@ -182,7 +200,6 @@ def criar_tabela_usuarios_simples(client):
     
     df = pd.DataFrame(dados_usuarios).astype(str).replace("None", "").replace("nan", "")
     
-    # WRITE_TRUNCATE apaga tudo e recria
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
         create_disposition="CREATE_IF_NEEDED"
@@ -195,12 +212,10 @@ def criar_tabela_usuarios_simples(client):
     ).result()
     
     print("✅ Tabela raw_controle_acesso criada/atualizada")
-#---------------------------------------------------------------------------------------------------
 
 def popular_tabelas_estaticas(client):
     print("🚦 Verificando Tabelas Estáticas...")
     
-    # 1. Tabelas Fixas (Dicionário)
     for tabela, dados in DADOS_ESTATICOS.items():
         try:
             res = list(client.query(f"SELECT COUNT(*) FROM `{PROJECT_ID}.{DATASET_ID}.{tabela}`").result())
@@ -209,7 +224,6 @@ def popular_tabelas_estaticas(client):
                 client.load_table_from_dataframe(pd.DataFrame(dados), client.dataset(DATASET_ID).table(tabela), job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")).result()
         except Exception as e: print(f"❌ Erro {tabela}: {e}")
 
-    # 2. Tabela de Tempo (Gerada Matematicamente)
     try:
         res = list(client.query(f"SELECT COUNT(*) FROM `{PROJECT_ID}.{DATASET_ID}.raw_tempo`").result())
         if res[0][0] == 0:
@@ -240,9 +254,7 @@ def inicializar_ambiente(client):
                     client.load_table_from_dataframe(df, ref, job_config=job_config).result()
                 except: pass
 
-    # CHAMA A POPULAÇÃO AUTOMÁTICA
     criar_tabela_usuarios_simples(client)
-
     popular_tabelas_estaticas(client)
 
     cnt_compra = obter_max_id_hibrido(client, "raw_compras", "compra_id", "C", "raw_compras.csv")
@@ -262,26 +274,15 @@ def inicializar_ambiente(client):
         CACHE["DEFEITOS"] = pd.read_csv("raw_defeito.csv")['defeito_id'].tolist()
     except: CACHE["CLIENTES"] = ["C001"]
 
-    # ---------------------------------------------------------
-    # NOVO BLOCO: Sincronização da Tabela de Segurança (Lookup)
-    # ---------------------------------------------------------
     print("🔒 Sincronizando tabela técnica de Lookup (Security)...")
-    
-    # Define o dataset silver trocando o nome, já que o DATASET_ID é bronze
     dataset_silver = DATASET_ID.replace("bronze", "silver")
-    
-    # Esta query apaga a lookup antiga e cria uma nova baseada na raw_controle_acesso
     query_sync_lookup = f"""
     CREATE OR REPLACE TABLE `{PROJECT_ID}.{dataset_silver}.sys_acessos_lookup` AS
-    SELECT DISTINCT
-        email_usuario,
-        cargo
-    FROM `{PROJECT_ID}.{DATASET_ID}.raw_controle_acesso`
+    SELECT DISTINCT email_usuario, cargo FROM `{PROJECT_ID}.{DATASET_ID}.raw_controle_acesso`
     WHERE email_usuario IS NOT NULL
     """
-    
     try:
-        client.query(query_sync_lookup).result() # O .result() força o Python a esperar terminar
+        client.query(query_sync_lookup).result()
         print("   ✅ Tabela sys_acessos_lookup atualizada com sucesso.")
     except Exception as e:
         print(f"   ❌ ERRO CRÍTICO: Falha ao atualizar Lookup de Segurança: {e}")
@@ -318,7 +319,8 @@ def gerar_compras(data_sim, forcar_compra=False):
             dados.append(item); estoque_materia_prima.append({"id": cid, "mp": mp_id})
     return dados
 
-def gerar_producao(data_sim):
+# --- AQUI ESTAVA O PROBLEMA DE MEMÓRIA (Corrigido para usar client existente) ---
+def gerar_producao(client, data_sim):
     global cnt_op, cnt_lote, estoque_produtos_acabados, CACHE
     d_fact=[]; d_dim=[]; d_map=[]; d_qual=[]
     if len(estoque_materia_prima) < 5: return [],[],[],[]
@@ -342,14 +344,14 @@ def gerar_producao(data_sim):
         q_plan = random.choice([100,200]); q_prod = int(q_plan*random.uniform(0.9,1.0))
         d_fact.append({"ordem_producao_id": op_id, "lote_id": lid, "produto_id": pid, "linha_id": d_dim[-1]["linha_id"], "maquina_id": mid, "turno_id": calcular_turno(data_sim), "inicio": ini.strftime("%Y-%m-%d %H:%M:%S"), "temperatura_media_c": temp, "vibracao_media_rpm": vib, "pressao_media_bar": pres, "ciclo_minuto_nominal": 5.0, "duracao_horas": dur, "quantidade_planejada": q_plan, "quantidade_produzida": q_prod, "quantidade_refugada": q_plan-q_prod})
 
-        # --- MONITORAMENTO: ALERTA DE LOG (NOVO) ---
+        # --- MONITORAMENTO: ALERTA (CORRIGIDO) ---
         if temp > 95.0:
             alerta = {"evento": "ALERTA_MAQUINA", "tipo": "SUPERAQUECIMENTO", "maquina": mid, "temp": temp, "msg": "CRITICO: Maquina superaquecida!"}
-            logging.error(str(alerta)) # Log como ERRO para o Monitoring pegar
-            registrar_alerta_bq(bigquery.Client(), alerta)
+            logging.error(str(alerta)) 
+            # AGORA USA O CLIENTE PASSADO (NÃO CRIA UM NOVO)
+            registrar_alerta_bq(client, alerta)
         elif vib > 2200:
             logging.warning(f"ALERTA_VIBRACAO: Maquina {mid} vibrando muito ({vib} RPM)")
-        # -------------------------------------------
 
         insumos = random.sample(estoque_materia_prima, k=min(len(estoque_materia_prima), 2))
         for ins in insumos: d_map.append({"lote_id": lid, "compra_id": ins["id"]})
@@ -360,7 +362,6 @@ def gerar_producao(data_sim):
         
         d_qual.append({"teste_id": f"T{cnt_lote}", "lote_id": lid, "produto_id": pid, "data_teste": (fim+timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"), "tensao_medida_v": 10.5 if tem_def else 12.6, "resistencia_interna_mohm": 8.0 if tem_def else 6.0, "capacidade_ah_teste": 60.0, "defeito_id": d_rep, "aprovado": aprovado})
         
-        # --- MONITORAMENTO: QUALIDADE ---
         if aprovado == 0:
             logging.warning(f"ALERTA_QUALIDADE: Lote {lid} reprovado por defeito {d_rep}")
 
@@ -421,7 +422,8 @@ def executar_simulacao(request):
         data_sim += timedelta(hours=1)
         b_cli.extend(gerar_novos_clientes(data_sim))
         b_comp.extend(gerar_compras(data_sim))
-        df, dd, dm, dq = gerar_producao(data_sim)
+        # PASSANDO O CLIENT PARA EVITAR O CRASH
+        df, dd, dm, dq = gerar_producao(client, data_sim)
         b_prod.extend(df); b_lote.extend(dd); b_map.extend(dm); b_qual.extend(dq)
         b_vend.extend(gerar_vendas(data_sim))
         b_gar.extend(gerar_garantia(data_sim))
@@ -440,25 +442,3 @@ def executar_simulacao(request):
     atualizar_clientes_pos_simulacao(client)
     
     return f"Simulação concluída, Calendário checado e Alertas de Logs disparados (se houver)!"
-    
-# --- FUNÇÃO NOVA: ENVIAR PARA PAINEL ANDON (TV) ---
-def registrar_alerta_bq(client, alerta):
-    try:
-        # Tenta pegar as variaveis globais PROJECT_ID e DATASET_ID que devem estar definidas no inicio do seu script
-        # Se nao tiver, define aqui como garantia:
-        proj = "autovolt-analytics-479417"
-        data = "autovolt_bronze"
-        
-        row = {
-            "alerta_id": f"ALT-{int(time.time())}",
-            "data_ocorrencia": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "nivel": "CRITICO",
-            "maquina_id": str(alerta.get("maquina", "M000")),
-            "mensagem": str(alerta.get("msg", "ERRO CRITICO")),
-            "valor_medido": float(alerta.get("temp", 0.0))
-        }
-        # Insere direto na tabela de alertas
-        client.insert_rows_json(f"{proj}.{data}.monitoramento_alertas", [row])
-        logging.info("Alerta enviado para Painel TV BigQuery")
-    except Exception as e:
-        logging.error(f"Erro ao atualizar Painel TV: {e}")
