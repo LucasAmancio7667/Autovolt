@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 # --- CONFIGURAÇÃO DO PROJETO ---
 PROJECT_ID = "autovolt-analytics-479417"
 DATASET_ID = "autovolt_bronze"
-HORAS_POR_LOTE = 24  
+HORAS_POR_LOTE = 1 
 
 # --- SCHEMAS ---
 SCHEMAS = {
@@ -351,7 +351,10 @@ def gerar_producao(client, data_sim):
             # AGORA USA O CLIENTE PASSADO (NÃO CRIA UM NOVO)
             registrar_alerta_bq(client, alerta)
         elif vib > 2200:
-            logging.warning(f"ALERTA_VIBRACAO: Maquina {mid} vibrando muito ({vib} RPM)")
+            msg_erro = f"CRITICO: Vibracao excessiva ({vib} RPM)!"
+            alerta = {"evento": "ALERTA_MAQUINA", "tipo": "VIBRACAO", "maquina": mid, "temp": temp, "msg": msg_erro}
+            logging.warning(msg_erro)
+            registrar_alerta_bq(client, alerta) 
 
         insumos = random.sample(estoque_materia_prima, k=min(len(estoque_materia_prima), 2))
         for ins in insumos: d_map.append({"lote_id": lid, "compra_id": ins["id"]})
