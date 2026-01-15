@@ -86,7 +86,7 @@ def registrar_alerta_bq(client, alerta):
     try:
         row = {
             "alerta_id": f"ALT-{int(time.time())}",
-            "data_ocorrencia": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "data_ocorrencia": (datetime.now() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
             "nivel": "CRITICO",
             "maquina_id": str(alerta.get("maquina", "M000")),
             "mensagem": str(alerta.get("msg", "ERRO CRITICO")),
