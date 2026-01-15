@@ -324,9 +324,13 @@ def gerar_producao(client, data_sim):
     global cnt_op, cnt_lote, estoque_produtos_acabados, CACHE
     d_fact=[]; d_dim=[]; d_map=[]; d_qual=[]
     if len(estoque_materia_prima) < 5: return [],[],[],[]
-    for _ in range(random.randint(1, 4)):
+    
+    lista_maquinas = CACHE["MAQUINAS"] or ["M001"]
+
+    for mid in lista_maquinas: 
         cnt_op += 1; cnt_lote += 1
         op_id = f"OP{cnt_op}"; lid = f"Lote{cnt_lote}"
+
         maquinas_lista = CACHE["MAQUINAS"] or ["M001"]; produtos_lista = list(CACHE["PRODUTOS"].keys()) or ["BAT001"]
         linhas_lista = CACHE["LINHAS"] or ["L01"]; defeitos_lista = CACHE["DEFEITOS"] or ["D00"]
         mid = random.choice(maquinas_lista); pid = random.choice(produtos_lista)
