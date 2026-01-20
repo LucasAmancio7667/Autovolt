@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 # --- CONFIGURAÇÃO DO PROJETO ---
 PROJECT_ID = "autovolt-analytics-479417"
 DATASET_ID = "autovolt_bronze"
-HORAS_POR_LOTE = 24 
+HORAS_POR_LOTE = 1 
 
 # --- SCHEMAS ---
 SCHEMAS = {
@@ -323,33 +323,44 @@ def gerar_compras(data_sim, forcar_compra=False):
 # --- SUBSTITUA A FUNÇÃO GERAR_PRODUCAO POR ESTA ---
 def gerar_producao(client, data_sim):
     global cnt_op, cnt_lote, estoque_produtos_acabados, CACHE
+    
+    # --- FIX CRÍTICO: Importar biblioteca de fuso horário ---
+    import pytz 
+    
     d_fact=[]; d_dim=[]; d_map=[]; d_qual=[]
 
-    # --- MUDANÇA 1: REMOVI A TRAVA DE ESTOQUE (COMENTADA) ---
-    # if len(estoque_materia_prima) < 5: 
-    #     print("⚠️ AVISO: Estoque baixo, mas vou produzir mesmo assim para teste!")
-    
     # Vamos garantir que temos maquinas
     lista_maquinas = CACHE.get("MAQUINAS", [])
     if not lista_maquinas:
-        lista_maquinas = ["M001", "M002", "M003"] # Fallback se o cache falhar
+        lista_maquinas = ["M001", "M002", "M003"]
         print("⚠️ AVISO: Cache de máquinas vazio. Usando lista padrão.")
 
     print(f"🏭 Iniciando produção para {len(lista_maquinas)} máquinas...")
+
+    # --- FIX CRÍTICO: Definindo o AGORA em Recife ---
+    fuso = pytz.timezone('America/Recife')
+    agora_recife = datetime.now(fuso)
+    # -----------------------------------------------
 
     for mid in lista_maquinas:
         cnt_op += 1; cnt_lote += 1
         op_id = f"OP{cnt_op}"; lid = f"Lote{cnt_lote}"
         
-        # Lógica simplificada de produtos e linhas
         produtos_lista = list(CACHE.get("PRODUTOS", {}).keys()) or ["BAT001"]
         linhas_lista = CACHE.get("LINHAS", []) or ["L01"]
         defeitos_lista = CACHE.get("DEFEITOS", []) or ["D00"]
         
         pid = random.choice(produtos_lista)
-        dur = round(random.uniform(3,10),1); ini = data_sim; fim = ini+timedelta(hours=dur)
         
-        # Probabilidade ajustada (M001 pior)
+        # --- FIX CRÍTICO: Usando a data de AGORA (ignorando data_sim) ---
+        # Variamos levemente os minutos para não ficar tudo no mesmo segundo exato
+        minutos_atras = random.randint(0, 50)
+        ini = agora_recife - timedelta(minutes=minutos_atras)
+        
+        dur = round(random.uniform(3,10),1)
+        fim = ini + timedelta(hours=dur)
+        # -------------------------------------------------------------
+        
         esta_em_surto = random.random() < (0.05 if mid == "M001" else 0.005)
         
         if esta_em_surto:
@@ -363,10 +374,7 @@ def gerar_producao(client, data_sim):
         
         q_plan = random.choice([100,200]); q_prod = int(q_plan*random.uniform(0.9,1.0))
         
-        # Ajuste Fuso Horário Brasil (-3h) apenas para visualização se quiser, mas mantendo UTC no banco é padrão.
-        # Se quiser gravar BR, subtraia aqui. Vamos manter simples.
-        
-        d_fact.append({"ordem_producao_id": op_id, "lote_id": lid, "produto_id": pid, "linha_id": d_dim[-1]["linha_id"], "maquina_id": mid, "turno_id": calcular_turno(data_sim), "inicio": ini.strftime("%Y-%m-%d %H:%M:%S"), "temperatura_media_c": temp, "vibracao_media_rpm": vib, "pressao_media_bar": pres, "ciclo_minuto_nominal": 5.0, "duracao_horas": dur, "quantidade_planejada": q_plan, "quantidade_produzida": q_prod, "quantidade_refugada": q_plan-q_prod})
+        d_fact.append({"ordem_producao_id": op_id, "lote_id": lid, "produto_id": pid, "linha_id": d_dim[-1]["linha_id"], "maquina_id": mid, "turno_id": calcular_turno(ini), "inicio": ini.strftime("%Y-%m-%d %H:%M:%S"), "temperatura_media_c": temp, "vibracao_media_rpm": vib, "pressao_media_bar": pres, "ciclo_minuto_nominal": 5.0, "duracao_horas": dur, "quantidade_planejada": q_plan, "quantidade_produzida": q_prod, "quantidade_refugada": q_plan-q_prod})
 
         # --- ALERTA ---
         if temp > 95.0:
@@ -375,19 +383,14 @@ def gerar_producao(client, data_sim):
             registrar_alerta_bq(client, alerta)
         elif vib > 2200:
             alerta = {"evento": "ALERTA_MAQUINA", "tipo": "VIBRACAO", "maquina": mid, "temp": temp, "msg": f"CRITICO: Vibracao excessiva ({vib} RPM)!"}
-            print(f"〰️ ALERTA VIBRAÇÃO: {alerta}")
+            print(f"〰️ ALERTA VIBRACAO: {alerta}")
             registrar_alerta_bq(client, alerta)
 
-        # Consumo Falso de Matéria Prima (Para não travar se a lista tiver vazia)
-        # insumos = random.sample(estoque_materia_prima, k=min(len(estoque_materia_prima), 2))
-        # ... lógica de mapeamento ...
-        
-        # Qualidade
         d_qual.append({"teste_id": f"T{cnt_lote}", "lote_id": lid, "produto_id": pid, "data_teste": (fim+timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"), "tensao_medida_v": 12.6, "resistencia_interna_mohm": 6.0, "capacidade_ah_teste": 60.0, "defeito_id": "D00", "aprovado": 1})
         
         estoque_produtos_acabados.append({"lote_id": lid, "produto_id": pid, "op_id": op_id, "def": None})
 
-    print(f"✅ Produção finalizada. Gerados {len(d_fact)} registros de fatos.")
+    print(f"✅ Produção finalizada. Gerados {len(d_fact)} registros de fatos (Horário Recife: {agora_recife}).")
     return d_fact, d_dim, d_map, d_qual
 
 # --- SUBSTITUA A FUNÇÃO EXECUTAR_SIMULACAO POR ESTA ---
