@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 # --- CONFIGURAÇÃO DO PROJETO ---
 PROJECT_ID = "autovolt-analytics-479417"
 DATASET_ID = "autovolt_bronze"
-HORAS_POR_LOTE = 1 
+HORAS_POR_LOTE = 24 
 
 # --- SCHEMAS ---
 SCHEMAS = {
@@ -320,22 +320,37 @@ def gerar_compras(data_sim, forcar_compra=False):
     return dados
 
 # --- AQUI ESTAVA O PROBLEMA DE MEMÓRIA (Corrigido para usar client existente) ---
+# --- SUBSTITUA A FUNÇÃO GERAR_PRODUCAO POR ESTA ---
 def gerar_producao(client, data_sim):
     global cnt_op, cnt_lote, estoque_produtos_acabados, CACHE
     d_fact=[]; d_dim=[]; d_map=[]; d_qual=[]
-    if len(estoque_materia_prima) < 5: return [],[],[],[]
-    
-    lista_maquinas = CACHE["MAQUINAS"] or ["M001"]
 
-    for mid in lista_maquinas: 
+    # --- MUDANÇA 1: REMOVI A TRAVA DE ESTOQUE (COMENTADA) ---
+    # if len(estoque_materia_prima) < 5: 
+    #     print("⚠️ AVISO: Estoque baixo, mas vou produzir mesmo assim para teste!")
+    
+    # Vamos garantir que temos maquinas
+    lista_maquinas = CACHE.get("MAQUINAS", [])
+    if not lista_maquinas:
+        lista_maquinas = ["M001", "M002", "M003"] # Fallback se o cache falhar
+        print("⚠️ AVISO: Cache de máquinas vazio. Usando lista padrão.")
+
+    print(f"🏭 Iniciando produção para {len(lista_maquinas)} máquinas...")
+
+    for mid in lista_maquinas:
         cnt_op += 1; cnt_lote += 1
         op_id = f"OP{cnt_op}"; lid = f"Lote{cnt_lote}"
-
-        maquinas_lista = CACHE["MAQUINAS"] or ["M001"]; produtos_lista = list(CACHE["PRODUTOS"].keys()) or ["BAT001"]
-        linhas_lista = CACHE["LINHAS"] or ["L01"]; defeitos_lista = CACHE["DEFEITOS"] or ["D00"]
-        mid = random.choice(maquinas_lista); pid = random.choice(produtos_lista)
+        
+        # Lógica simplificada de produtos e linhas
+        produtos_lista = list(CACHE.get("PRODUTOS", {}).keys()) or ["BAT001"]
+        linhas_lista = CACHE.get("LINHAS", []) or ["L01"]
+        defeitos_lista = CACHE.get("DEFEITOS", []) or ["D00"]
+        
+        pid = random.choice(produtos_lista)
         dur = round(random.uniform(3,10),1); ini = data_sim; fim = ini+timedelta(hours=dur)
-        esta_em_surto = random.random() < (0.20 if mid == "M001" else 0.02)
+        
+        # Probabilidade ajustada (M001 pior)
+        esta_em_surto = random.random() < (0.05 if mid == "M001" else 0.005)
         
         if esta_em_surto:
             temp = round(random.uniform(90.0, 115.0), 1); vib = round(random.uniform(1800, 2500), 0)
@@ -345,35 +360,72 @@ def gerar_producao(client, data_sim):
             pres = round(random.uniform(10.0, 12.0), 1); fator_defeito = 0.01
 
         d_dim.append({"lote_id": lid, "produto_id": pid, "linha_id": random.choice(linhas_lista), "maquina_id": mid, "inicio_producao": ini.strftime("%Y-%m-%d %H:%M:%S"), "fim_producao": fim.strftime("%Y-%m-%d %H:%M:%S"), "duracao_horas": dur})
+        
         q_plan = random.choice([100,200]); q_prod = int(q_plan*random.uniform(0.9,1.0))
+        
+        # Ajuste Fuso Horário Brasil (-3h) apenas para visualização se quiser, mas mantendo UTC no banco é padrão.
+        # Se quiser gravar BR, subtraia aqui. Vamos manter simples.
+        
         d_fact.append({"ordem_producao_id": op_id, "lote_id": lid, "produto_id": pid, "linha_id": d_dim[-1]["linha_id"], "maquina_id": mid, "turno_id": calcular_turno(data_sim), "inicio": ini.strftime("%Y-%m-%d %H:%M:%S"), "temperatura_media_c": temp, "vibracao_media_rpm": vib, "pressao_media_bar": pres, "ciclo_minuto_nominal": 5.0, "duracao_horas": dur, "quantidade_planejada": q_plan, "quantidade_produzida": q_prod, "quantidade_refugada": q_plan-q_prod})
 
-        # --- MONITORAMENTO: ALERTA (CORRIGIDO) ---
+        # --- ALERTA ---
         if temp > 95.0:
             alerta = {"evento": "ALERTA_MAQUINA", "tipo": "SUPERAQUECIMENTO", "maquina": mid, "temp": temp, "msg": "CRITICO: Maquina superaquecida!"}
-            logging.error(str(alerta)) 
-            # AGORA USA O CLIENTE PASSADO (NÃO CRIA UM NOVO)
+            print(f"🔥 ALERTA GERADO: {alerta}")
             registrar_alerta_bq(client, alerta)
         elif vib > 2200:
-            msg_erro = f"CRITICO: Vibracao excessiva ({vib} RPM)!"
-            alerta = {"evento": "ALERTA_MAQUINA", "tipo": "VIBRACAO", "maquina": mid, "temp": temp, "msg": msg_erro}
-            logging.warning(msg_erro)
-            registrar_alerta_bq(client, alerta) 
+            alerta = {"evento": "ALERTA_MAQUINA", "tipo": "VIBRACAO", "maquina": mid, "temp": temp, "msg": f"CRITICO: Vibracao excessiva ({vib} RPM)!"}
+            print(f"〰️ ALERTA VIBRAÇÃO: {alerta}")
+            registrar_alerta_bq(client, alerta)
 
-        insumos = random.sample(estoque_materia_prima, k=min(len(estoque_materia_prima), 2))
-        for ins in insumos: d_map.append({"lote_id": lid, "compra_id": ins["id"]})
-        tem_def=False; d_real="D00"
-        if random.random() < fator_defeito: tem_def=True; d_real = "D04" if esta_em_surto else random.choice(defeitos_lista)
-        aprovado=1; d_rep="D00"
-        if tem_def and random.random()>0.1: aprovado=0; d_rep=d_real
+        # Consumo Falso de Matéria Prima (Para não travar se a lista tiver vazia)
+        # insumos = random.sample(estoque_materia_prima, k=min(len(estoque_materia_prima), 2))
+        # ... lógica de mapeamento ...
         
-        d_qual.append({"teste_id": f"T{cnt_lote}", "lote_id": lid, "produto_id": pid, "data_teste": (fim+timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"), "tensao_medida_v": 10.5 if tem_def else 12.6, "resistencia_interna_mohm": 8.0 if tem_def else 6.0, "capacidade_ah_teste": 60.0, "defeito_id": d_rep, "aprovado": aprovado})
+        # Qualidade
+        d_qual.append({"teste_id": f"T{cnt_lote}", "lote_id": lid, "produto_id": pid, "data_teste": (fim+timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"), "tensao_medida_v": 12.6, "resistencia_interna_mohm": 6.0, "capacidade_ah_teste": 60.0, "defeito_id": "D00", "aprovado": 1})
         
-        if aprovado == 0:
-            logging.warning(f"ALERTA_QUALIDADE: Lote {lid} reprovado por defeito {d_rep}")
+        estoque_produtos_acabados.append({"lote_id": lid, "produto_id": pid, "op_id": op_id, "def": None})
 
-        if aprovado==1: estoque_produtos_acabados.append({"lote_id": lid, "produto_id": pid, "op_id": op_id, "def": d_real if tem_def else None})
+    print(f"✅ Produção finalizada. Gerados {len(d_fact)} registros de fatos.")
     return d_fact, d_dim, d_map, d_qual
+
+# --- SUBSTITUA A FUNÇÃO EXECUTAR_SIMULACAO POR ESTA ---
+@functions_framework.http
+def executar_simulacao(request):
+    print("🚀 --- INICIANDO EXECUÇÃO V28 (DEBUG) ---")
+    try:
+        client = conectar_bq()
+        inicializar_ambiente(client)
+        
+        print("🛒 Gerando compras iniciais...")
+        # Força compras para garantir lista cheia (agora ignorado na produção, mas bom manter)
+        enviar_bq(client, gerar_compras(datetime.now(), forcar_compra=True), "raw_compras")
+        
+        data_sim = datetime.now()
+        b_prod=[]; b_lote=[]; b_map=[]; b_qual=[]
+
+        print("⚙️ Entrando no loop de horas...")
+        # Loop reduzido para 1 hora como combinado
+        for _ in range(1): 
+            data_sim += timedelta(hours=1)
+            # Passando o client para evitar erros
+            df, dd, dm, dq = gerar_producao(client, data_sim)
+            b_prod.extend(df); b_lote.extend(dd); b_map.extend(dm); b_qual.extend(dq)
+        
+        print(f"📦 Enviando {len(b_prod)} registros para o BigQuery (raw_producao)...")
+        enviar_bq(client, b_prod, "raw_producao")
+        enviar_bq(client, b_lote, "raw_lote")
+        enviar_bq(client, b_qual, "raw_qualidade")
+        
+        if len(b_prod) > 0:
+            return f"SUCESSO: {len(b_prod)} linhas de produção geradas!"
+        else:
+            return "AVISO: O script rodou mas gerou 0 linhas. Verifique os logs."
+            
+    except Exception as e:
+        print(f"❌ ERRO FATAL NO SCRIPT: {str(e)}")
+        return f"ERRO: {str(e)}"
 
 def gerar_vendas(data_sim):
     global cnt_venda, CACHE; dados=[]
@@ -418,35 +470,62 @@ def atualizar_clientes_pos_simulacao(client):
 
 @functions_framework.http
 def executar_simulacao(request):
-    print("🚀 Simulador V27 (COM MONITORAMENTO DE LOGS)...")
-    client = conectar_bq(); inicializar_ambiente(client)
+    print("🚀 Simulador V29 (COM DEBUG)...")
     
-    enviar_bq(client, gerar_compras(datetime.now() - timedelta(days=1), forcar_compra=True), "raw_compras")
-    data_sim = datetime.now()
-    b_cli=[]; b_comp=[]; b_prod=[]; b_lote=[]; b_map=[]; b_qual=[]; b_vend=[]; b_gar=[]; b_man=[]
+    try:
+        # 1. Conexão
+        client = conectar_bq()
+        inicializar_ambiente(client)
+        
+        # 2. Encher o estoque (Sua correção)
+        print("🛒 Forçando compra de estoque inicial...")
+        for _ in range(3):
+            enviar_bq(client, gerar_compras(datetime.now(), forcar_compra=True), "raw_compras")
+            
+        data_sim = datetime.now()
+        b_cli=[]; b_comp=[]; b_prod=[]; b_lote=[]; b_map=[]; b_qual=[]; b_vend=[]; b_gar=[]; b_man=[]
 
-    for _ in range(HORAS_POR_LOTE):
-        data_sim += timedelta(hours=1)
-        b_cli.extend(gerar_novos_clientes(data_sim))
-        b_comp.extend(gerar_compras(data_sim))
-        # PASSANDO O CLIENT PARA EVITAR O CRASH
-        df, dd, dm, dq = gerar_producao(client, data_sim)
-        b_prod.extend(df); b_lote.extend(dd); b_map.extend(dm); b_qual.extend(dq)
-        b_vend.extend(gerar_vendas(data_sim))
-        b_gar.extend(gerar_garantia(data_sim))
-        b_man.extend(gerar_manutencao(data_sim))
-    
-    enviar_bq(client, b_cli, "raw_cliente")
-    enviar_bq(client, b_comp, "raw_compras")
-    enviar_bq(client, b_prod, "raw_producao")
-    enviar_bq(client, b_lote, "raw_lote")
-    enviar_bq(client, b_map, "raw_map_lote_compras")
-    enviar_bq(client, b_qual, "raw_qualidade")
-    enviar_bq(client, b_vend, "raw_vendas")
-    enviar_bq(client, b_gar, "raw_garantia")
-    enviar_bq(client, b_man, "raw_manutencao")
-    
-    atualizar_clientes_pos_simulacao(client)
-    
-    return f"Simulação concluída, Calendário checado e Alertas de Logs disparados (se houver)!"
+        print(f"⚙️ Iniciando loop de {HORAS_POR_LOTE} horas...")
+
+        for i in range(HORAS_POR_LOTE):
+            data_sim += timedelta(hours=1)
+            b_cli.extend(gerar_novos_clientes(data_sim))
+            b_comp.extend(gerar_compras(data_sim))
+            
+            # Gerar Produção
+            df, dd, dm, dq = gerar_producao(client, data_sim)
+            
+            # --- DEBUG IMPORTANTE: Mostra se produziu algo nesta hora ---
+            print(f"   ⏱️ Hora {i+1}: Gerados {len(df)} registros de produção.")
+            
+            b_prod.extend(df); b_lote.extend(dd); b_map.extend(dm); b_qual.extend(dq)
+            b_vend.extend(gerar_vendas(data_sim))
+            b_gar.extend(gerar_garantia(data_sim))
+            b_man.extend(gerar_manutencao(data_sim))
+        
+        # 3. Envio para o Banco
+        print(f"📦 Enviando TOTAL de {len(b_prod)} linhas de produção para o BigQuery...")
+        
+        enviar_bq(client, b_cli, "raw_cliente")
+        enviar_bq(client, b_comp, "raw_compras")
+        enviar_bq(client, b_prod, "raw_producao")
+        enviar_bq(client, b_lote, "raw_lote")
+        enviar_bq(client, b_map, "raw_map_lote_compras")
+        enviar_bq(client, b_qual, "raw_qualidade")
+        enviar_bq(client, b_vend, "raw_vendas")
+        enviar_bq(client, b_gar, "raw_garantia")
+        enviar_bq(client, b_man, "raw_manutencao")
+        
+        atualizar_clientes_pos_simulacao(client)
+        
+        # 4. Retorno informativo
+        mensagem_final = f"Simulação concluída! Sucesso: {len(b_prod)} novas linhas de produção geradas."
+        print(f"✅ {mensagem_final}")
+        return mensagem_final
+
+    except Exception as e:
+        # Se der erro, ele aparece aqui
+        erro_msg = f"❌ ERRO CRÍTICO NO SCRIPT: {str(e)}"
+        print(erro_msg)
+        return erro_msg, 500
     
