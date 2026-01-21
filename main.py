@@ -319,78 +319,83 @@ def gerar_compras(data_sim, forcar_compra=False):
             dados.append(item); estoque_materia_prima.append({"id": cid, "mp": mp_id})
     return dados
 
-# --- AQUI ESTAVA O PROBLEMA DE MEMÓRIA (Corrigido para usar client existente) ---
-# --- SUBSTITUA A FUNÇÃO GERAR_PRODUCAO POR ESTA ---
+
+# --- VERSÃO CORRIGIDA: FORÇA A DATA DE HOJE (SEM PYTZ) ---
 def gerar_producao(client, data_sim):
     global cnt_op, cnt_lote, estoque_produtos_acabados, CACHE
     
-    # --- FIX CRÍTICO: Importar biblioteca de fuso horário ---
-    import pytz 
+    # 1. Importações Nativas (Funciona em qualquer Python)
+    from datetime import datetime, timedelta, timezone
     
     d_fact=[]; d_dim=[]; d_map=[]; d_qual=[]
 
-    # Vamos garantir que temos maquinas
+    # 2. Forçar Data de Agora (Fuso -3h Recife/Brasília na mão)
+    fuso_br = timezone(timedelta(hours=-3))
+    agora = datetime.now(fuso_br)
+    # ---------------------------------------------------------
+
+    # Garante máquinas
     lista_maquinas = CACHE.get("MAQUINAS", [])
     if not lista_maquinas:
-        lista_maquinas = ["M001", "M002", "M003"]
-        print("⚠️ AVISO: Cache de máquinas vazio. Usando lista padrão.")
+        lista_maquinas = [f"M{i:03d}" for i in range(1, 21)]
 
-    print(f"🏭 Iniciando produção para {len(lista_maquinas)} máquinas...")
-
-    # --- FIX CRÍTICO: Definindo o AGORA em Recife ---
-    fuso = pytz.timezone('America/Recife')
-    agora_recife = datetime.now(fuso)
-    # -----------------------------------------------
+    print(f"🏭 Produzindo em: {agora} (Forçado)")
 
     for mid in lista_maquinas:
         cnt_op += 1; cnt_lote += 1
         op_id = f"OP{cnt_op}"; lid = f"Lote{cnt_lote}"
         
-        produtos_lista = list(CACHE.get("PRODUTOS", {}).keys()) or ["BAT001"]
-        linhas_lista = CACHE.get("LINHAS", []) or ["L01"]
-        defeitos_lista = CACHE.get("DEFEITOS", []) or ["D00"]
-        
-        pid = random.choice(produtos_lista)
-        
-        # --- FIX CRÍTICO: Usando a data de AGORA (ignorando data_sim) ---
-        # Variamos levemente os minutos para não ficar tudo no mesmo segundo exato
+        # Define horário: Agora menos alguns minutos aleatórios
         minutos_atras = random.randint(0, 50)
-        ini = agora_recife - timedelta(minutes=minutos_atras)
-        
+        ini = agora - timedelta(minutes=minutos_atras)
         dur = round(random.uniform(3,10),1)
         fim = ini + timedelta(hours=dur)
-        # -------------------------------------------------------------
         
+        # Preenche dados básicos se cache falhar
+        produtos_lista = list(CACHE.get("PRODUTOS", {}).keys()) or ["BAT001"]
+        linhas_lista = CACHE.get("LINHAS", []) or ["L01"]
+        pid = random.choice(produtos_lista)
+
+        # Simulação de Falhas
         esta_em_surto = random.random() < (0.05 if mid == "M001" else 0.005)
-        
         if esta_em_surto:
             temp = round(random.uniform(90.0, 115.0), 1); vib = round(random.uniform(1800, 2500), 0)
-            pres = round(random.uniform(6.0, 8.0), 1); fator_defeito = 0.80
+            pres = round(random.uniform(6.0, 8.0), 1)
         else:
             temp = round(random.uniform(55.0, 75.0), 1); vib = round(random.uniform(1000, 1400), 0)
-            pres = round(random.uniform(10.0, 12.0), 1); fator_defeito = 0.01
+            pres = round(random.uniform(10.0, 12.0), 1)
 
-        d_dim.append({"lote_id": lid, "produto_id": pid, "linha_id": random.choice(linhas_lista), "maquina_id": mid, "inicio_producao": ini.strftime("%Y-%m-%d %H:%M:%S"), "fim_producao": fim.strftime("%Y-%m-%d %H:%M:%S"), "duracao_horas": dur})
+        # Criação dos Dicionários (Igual ao original, mas usando a data 'ini' corrigida)
+        d_dim.append({
+            "lote_id": lid, "produto_id": pid, "linha_id": random.choice(linhas_lista), 
+            "maquina_id": mid, "inicio_producao": ini.strftime("%Y-%m-%d %H:%M:%S"), 
+            "fim_producao": fim.strftime("%Y-%m-%d %H:%M:%S"), "duracao_horas": dur
+        })
         
         q_plan = random.choice([100,200]); q_prod = int(q_plan*random.uniform(0.9,1.0))
         
-        d_fact.append({"ordem_producao_id": op_id, "lote_id": lid, "produto_id": pid, "linha_id": d_dim[-1]["linha_id"], "maquina_id": mid, "turno_id": calcular_turno(ini), "inicio": ini.strftime("%Y-%m-%d %H:%M:%S"), "temperatura_media_c": temp, "vibracao_media_rpm": vib, "pressao_media_bar": pres, "ciclo_minuto_nominal": 5.0, "duracao_horas": dur, "quantidade_planejada": q_plan, "quantidade_produzida": q_prod, "quantidade_refugada": q_plan-q_prod})
+        d_fact.append({
+            "ordem_producao_id": op_id, "lote_id": lid, "produto_id": pid, 
+            "linha_id": d_dim[-1]["linha_id"], "maquina_id": mid, "turno_id": calcular_turno(ini), 
+            "inicio": ini.strftime("%Y-%m-%d %H:%M:%S"), "temperatura_media_c": temp, 
+            "vibracao_media_rpm": vib, "pressao_media_bar": pres, "ciclo_minuto_nominal": 5.0, 
+            "duracao_horas": dur, "quantidade_planejada": q_plan, 
+            "quantidade_produzida": q_prod, "quantidade_refugada": q_plan-q_prod
+        })
 
-        # --- ALERTA ---
+        # Alertar BQ se falha grave
         if temp > 95.0:
-            alerta = {"evento": "ALERTA_MAQUINA", "tipo": "SUPERAQUECIMENTO", "maquina": mid, "temp": temp, "msg": "CRITICO: Maquina superaquecida!"}
-            print(f"🔥 ALERTA GERADO: {alerta}")
-            registrar_alerta_bq(client, alerta)
-        elif vib > 2200:
-            alerta = {"evento": "ALERTA_MAQUINA", "tipo": "VIBRACAO", "maquina": mid, "temp": temp, "msg": f"CRITICO: Vibracao excessiva ({vib} RPM)!"}
-            print(f"〰️ ALERTA VIBRACAO: {alerta}")
+            alerta = {"evento": "ALERTA_MAQUINA", "tipo": "SUPERAQUECIMENTO", "maquina": mid, "temp": temp, "msg": "CRITICO: Superaquecimento!"}
             registrar_alerta_bq(client, alerta)
 
-        d_qual.append({"teste_id": f"T{cnt_lote}", "lote_id": lid, "produto_id": pid, "data_teste": (fim+timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"), "tensao_medida_v": 12.6, "resistencia_interna_mohm": 6.0, "capacidade_ah_teste": 60.0, "defeito_id": "D00", "aprovado": 1})
-        
+        d_qual.append({
+            "teste_id": f"T{cnt_lote}", "lote_id": lid, "produto_id": pid, 
+            "data_teste": (fim+timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"), 
+            "tensao_medida_v": 12.6, "resistencia_interna_mohm": 6.0, 
+            "capacidade_ah_teste": 60.0, "defeito_id": "D00", "aprovado": 1
+        })
         estoque_produtos_acabados.append({"lote_id": lid, "produto_id": pid, "op_id": op_id, "def": None})
 
-    print(f"✅ Produção finalizada. Gerados {len(d_fact)} registros de fatos (Horário Recife: {agora_recife}).")
     return d_fact, d_dim, d_map, d_qual
 
 # --- SUBSTITUA A FUNÇÃO EXECUTAR_SIMULACAO POR ESTA ---
