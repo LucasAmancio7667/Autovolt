@@ -1,7 +1,5 @@
 functions-framework==3.*
-pandas
 google-cloud-bigquery
-db-dtypes
-pyarrow
-pytz
+google-cloud-storage
+pandas
 numpy

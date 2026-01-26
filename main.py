@@ -168,7 +168,7 @@ def enviar_bq(client, dados, tabela):
         job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
             write_disposition="WRITE_APPEND",
-            autodetect=True,
+            autodetect=False,
             ignore_unknown_values=True,
             schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION]
         )
