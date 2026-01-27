@@ -1,5 +1,5 @@
 functions-framework==3.*
-google-cloud-bigquery
-google-cloud-storage
-pandas
+google-cloud-bigquery>=3.0.0
+google-cloud-storage>=2.0.0
 numpy
+
