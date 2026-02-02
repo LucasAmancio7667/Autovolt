@@ -1,11 +1,12 @@
 # =========================
 # AUTOVOLT LAKEHOUSE (BRONZE) - Cloud Run HTTP
 # - Lake-first (GCS JSONL)
-# - BigQuery "hot layer" só ano atual (economia/free)
+# - BigQuery "hot layer" só ano atual (economia/free tier)
 # - Histórico (backfill) grava só no GCS
 # - Estado em state/state.json (migração automática)
-# - raw_vendas contém lote_id
-# - NÃO toca em raw_usuario / raw_controle_acesso
+# - raw_vendas contém lote_id e ordem_producao_id preenchido (via map lote->op)
+# - Garantias podem ser geradas a partir de vendas antigas (sales_history no state)
+# - NÃO toca em raw_usuario / raw_controle_acesso (nem cria, nem deleta)
 # =========================
 
 import functions_framework
@@ -32,7 +33,7 @@ PROJECT_ID = "autovolt-analytics-479417"
 DATASET_ID = "autovolt_bronze"
 BUCKET_NAME = "bucket_ingestao"
 
-TZ_BR = timezone(timedelta(hours=-3))  # America/Recife
+TZ_BR = timezone(timedelta(hours=-3))  # America/Recife (fixo -03)
 HORAS_POR_LOTE = 1
 
 STATE_FILE = "state/state.json"
@@ -170,7 +171,7 @@ SCHEMAS = {
         SchemaField("cliente_id", "STRING"),
         SchemaField("produto_id", "STRING"),
         SchemaField("ordem_producao_id", "STRING"),
-        SchemaField("lote_id", "STRING"),  # pedido do PBI
+        SchemaField("lote_id", "STRING"),
         SchemaField("data_venda", "STRING"),
         SchemaField("quantidade_vendida", "STRING"),
         SchemaField("valor_total_venda", "STRING"),
@@ -317,6 +318,12 @@ def default_state():
         "cnt_manut": 0,
         "clientes": [],
         "fleet": None,
+
+        "last_client_seed_date": "",
+
+        # NOVO: histórico de vendas para gerar garantias retroativas
+        "sales_history": [],
+        "sales_history_max": 5000,
     }
 
 def load_state(sc: storage.Client) -> dict:
@@ -340,9 +347,15 @@ def load_state(sc: storage.Client) -> dict:
         state["clientes"] = []
     if state.get("fleet") == []:
         state["fleet"] = None
+    if state.get("sales_history") is None:
+        state["sales_history"] = []
+    try:
+        state["sales_history_max"] = int(state.get("sales_history_max", 5000))
+    except Exception:
+        state["sales_history_max"] = 5000
 
     # garante inteiros
-    for k in ["cnt_op","cnt_lote","cnt_venda","cnt_compra","cnt_cliente","cnt_garantia","cnt_manut"]:
+    for k in ["cnt_op","cnt_lote","cnt_venda","cnt_compra","cnt_cliente","cnt_garantia","cnt_manut","seed"]:
         try:
             state[k] = int(state.get(k, 0))
         except Exception:
@@ -376,11 +389,31 @@ def hot_layer(dt: datetime) -> bool:
     # só carrega pro BQ dados do ano atual
     return dt.year == datetime.now(TZ_BR).year
 
+def push_sales_history(state: dict, vendas: list[dict]) -> None:
+    """Guarda histórico mínimo de vendas no state para gerar garantias retroativas."""
+    if not vendas:
+        return
+
+    hist = state.get("sales_history", []) or []
+    max_len = int(state.get("sales_history_max", 5000))
+
+    for v in vendas:
+        hist.append({
+            "cliente_id": v.get("cliente_id", ""),
+            "produto_id": v.get("produto_id", ""),
+            "lote_id": v.get("lote_id", ""),
+            "data_venda": v.get("data_venda", ""),  # YYYY-MM-DD
+        })
+
+    if len(hist) > max_len:
+        hist = hist[-max_len:]
+
+    state["sales_history"] = hist
+
 def write_gcs_jsonl(sc: storage.Client, table: str, rows: list[dict], run_id: str, dt: datetime) -> str:
     if not rows:
         return ""
 
-    # partição simples por data/hora
     prefix = f"bronze/{table}/dt={dt.date().isoformat()}/hr={dt.hour:02d}/run={run_id}"
     filename = f"part-{uuid.uuid4().hex}.jsonl"
     blob_name = f"{prefix}/{filename}"
@@ -450,6 +483,7 @@ def build_metas_vendas(dim_tempo):
 # FLEET / PHYSICS (ML-ready)
 # -------------------------
 def gen_fleet(state: dict) -> list[dict]:
+    # se já existe, reusa
     if state.get("fleet"):
         return state["fleet"]
 
@@ -459,8 +493,6 @@ def gen_fleet(state: dict) -> list[dict]:
             "maquina_id": f"M{i:03d}",
             "tipo": random.choice(["Montadora", "Injetora", "Envasadora", "Robo", "Tester"]),
             "fabricante": random.choice(["Siemens", "Bosch", "ABB", "Kuka", "Engel"]),
-            # máquinas mais antigas -> melhores no passado? na real: novas eram melhores no passado.
-            # então geramos anos espalhados, e o desgaste aumenta com o tempo.
             "ano": str(random.choice([2019, 2020, 2021, 2022, 2023, 2024])),
             "linha_id": random.choice(["L01", "L02", "L03", "L04", "L05"]),
         })
@@ -492,7 +524,7 @@ def calc_oee(dur_h: float, ciclo_min: float, perf: float):
     eff = float(np.clip(np.random.normal(perf, 0.05), 0.0, 1.0))
     qtd_prod = int(qtd_plan * eff)
 
-    taxa_ref = 0.01 + (1.0 - perf)  # pior perf -> mais refugo
+    taxa_ref = 0.01 + (1.0 - perf)
     qtd_ref = int(qtd_prod * random.uniform(0.0, taxa_ref))
 
     return qtd_plan, qtd_prod, qtd_ref
@@ -503,7 +535,7 @@ def calc_oee(dur_h: float, ciclo_min: float, perf: float):
 def gen_clientes(dt: datetime, state: dict):
     rows = []
 
-    # Cliente fundador (garante vendas sempre)
+    # Cliente fundador (garante base)
     if not state["clientes"]:
         state["cnt_cliente"] += 1
         cid = f"C{state['cnt_cliente']:04d}"
@@ -517,7 +549,7 @@ def gen_clientes(dt: datetime, state: dict):
             "data_ultima_compra": "",
         })
 
-    # Entrada de clientes ao longo do tempo (mais no passado, menos no presente)
+    # Entrada de clientes ao longo do tempo
     prob = 0.20 if dt.year <= 2023 else 0.08 if dt.year == 2024 else 0.04
     if random.random() < prob:
         state["cnt_cliente"] += 1
@@ -537,12 +569,10 @@ def gen_clientes(dt: datetime, state: dict):
 def gen_compras(dt: datetime, state: dict):
     rows = []
 
-    # compras mais frequentes quando a operação cresce
     prob = 0.55 if dt.year <= 2023 else 0.45 if dt.year == 2024 else 0.35
     if random.random() >= prob:
         return rows
 
-    # 1 a 4 compras por janela
     qtd = random.randint(1, 4)
     fornecedores = [f["fornecedor_id"] for f in DADOS_ESTATICOS["raw_fornecedor"]]
     materias = [m["materia_prima_id"] for m in DADOS_ESTATICOS["raw_materia_prima"]]
@@ -571,9 +601,9 @@ def gen_producao(dt: datetime, state: dict, fleet: list[dict]):
     lotes = []
     qual = []
     alerts = []
+    lote_to_op = {}  # NOVO: para vendas preencherem ordem_producao_id
 
     produtos = [p["produto_id"] for p in DADOS_ESTATICOS["raw_produto"]]
-    defeitos = [d["defeito_id"] for d in DADOS_ESTATICOS["raw_defeito"]]
 
     for m in fleet:
         state["cnt_op"] += 1
@@ -581,6 +611,7 @@ def gen_producao(dt: datetime, state: dict, fleet: list[dict]):
 
         op_id = f"OP{state['cnt_op']:07d}"
         lote_id = f"Lote{state['cnt_lote']:07d}"
+        lote_to_op[lote_id] = op_id
 
         temp, vib, perf = desgaste_maquina(m["ano"], dt)
 
@@ -642,7 +673,7 @@ def gen_producao(dt: datetime, state: dict, fleet: list[dict]):
                 "valor_medido": float(temp),
             })
 
-    return prod, lotes, qual, alerts
+    return prod, lotes, qual, alerts, lote_to_op
 
 def gen_map_lote_compras(lotes: list[dict], compras: list[dict]):
     rows = []
@@ -651,7 +682,6 @@ def gen_map_lote_compras(lotes: list[dict], compras: list[dict]):
 
     compra_ids = [c["compra_id"] for c in compras]
     for l in lotes:
-        # 0 a 3 vínculos por lote
         k = random.randint(0, min(3, len(compra_ids)))
         if k == 0:
             continue
@@ -660,54 +690,108 @@ def gen_map_lote_compras(lotes: list[dict], compras: list[dict]):
             rows.append({"lote_id": l["lote_id"], "compra_id": cid})
     return rows
 
-def gen_vendas(dt: datetime, state: dict, lotes: list[dict]):
+def gen_vendas(dt: datetime, state: dict, lotes: list[dict], lote_to_op: dict):
     rows = []
     if not lotes or not state["clientes"]:
         return rows
 
-    # vende ~20% dos lotes, mínimo 1
     n = max(1, len(lotes) // 5)
     amostra = lotes[:n]
 
     for l in amostra:
         state["cnt_venda"] += 1
+        lote_id = l["lote_id"]
+        op_id = lote_to_op.get(lote_id, "")
+
         rows.append({
             "venda_id": f"V{state['cnt_venda']:07d}",
             "ano_mes_id": dt.strftime("%Y-%m"),
             "cliente_id": random.choice(state["clientes"]),
             "produto_id": l["produto_id"],
-            "ordem_producao_id": "",  # opcional no bronze
-            "lote_id": l["lote_id"],  # pedido do PBI
+            "ordem_producao_id": op_id,      # ✅ preenchido
+            "lote_id": lote_id,
             "data_venda": dt.date().isoformat(),
             "quantidade_vendida": to_str(random.randint(20, 120)),
             "valor_total_venda": to_str(round(random.uniform(5000, 15000), 2)),
         })
+
+    # ✅ alimenta histórico para garantia retroativa
+    push_sales_history(state, rows)
+
     return rows
 
-def gen_garantia(dt: datetime, state: dict, vendas: list[dict]):
+def gen_garantia(dt: datetime, state: dict, vendas_lote: list[dict]):
     rows = []
-    if not vendas:
+
+    hist = state.get("sales_history", []) or []
+    pool = list(vendas_lote)
+
+    # mistura com amostra do histórico (vendas antigas)
+    if hist:
+        k = min(300, len(hist))
+        pool.extend(random.sample(hist, k=k))
+
+    if not pool:
         return rows
 
-    for v in vendas:
-        if random.random() < 0.01:
-            state["cnt_garantia"] += 1
-            dias = random.randint(1, 90)
-            status = random.choice(["Aprovada", "Negada", "Negada - Mau Uso"])
-            custo = round(random.uniform(200, 3000), 2) if "Aprovada" in status else 0.0
+    defeitos = [d["defeito_id"] for d in DADOS_ESTATICOS["raw_defeito"]]
+    defeitos_sem_d00 = [d for d in defeitos if d != "D00"] or ["D01", "D02", "D03", "D04", "D05"]
 
+    base_prob = 0.03 if dt.year <= 2023 else 0.02 if dt.year == 2024 else 0.015 if dt.year == 2025 else 0.01
+
+    for v in pool:
+        if random.random() < base_prob:
+            try:
+                venda_date = datetime.strptime(v["data_venda"], "%Y-%m-%d").replace(tzinfo=TZ_BR)
+            except Exception:
+                venda_date = dt
+
+            dias = random.randint(1, 90)
+            reclamacao_dt = venda_date + timedelta(days=dias)
+
+            procedente = random.random() < 0.65
+            status = "Aprovada" if procedente else random.choice(["Negada", "Negada - Mau Uso"])
+            defeito = random.choice(defeitos_sem_d00) if procedente else "D00"
+            custo = round(random.uniform(200, 3000), 2) if status == "Aprovada" else 0.0
+
+            state["cnt_garantia"] += 1
             rows.append({
                 "garantia_id": f"W{state['cnt_garantia']:07d}",
-                "cliente_id": v["cliente_id"],
-                "produto_id": v["produto_id"],
-                "lote_id": v["lote_id"],
-                "data_reclamacao": (dt + timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S"),
+                "cliente_id": v.get("cliente_id", ""),
+                "produto_id": v.get("produto_id", ""),
+                "lote_id": v.get("lote_id", ""),
+                "data_reclamacao": reclamacao_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "dias_pos_venda": to_str(dias),
-                "defeito_id": "D00",
+                "defeito_id": defeito,
                 "status": status,
                 "tempo_resposta_dias": to_str(random.randint(1, 15)),
                 "custo_garantia": to_str(custo),
             })
+
+    # fallback pra não ficar sempre 0
+    if not rows and pool and random.random() < 0.35:
+        v = random.choice(pool)
+        try:
+            venda_date = datetime.strptime(v.get("data_venda", ""), "%Y-%m-%d").replace(tzinfo=TZ_BR)
+        except Exception:
+            venda_date = dt
+
+        dias = random.randint(5, 60)
+        reclamacao_dt = venda_date + timedelta(days=dias)
+
+        state["cnt_garantia"] += 1
+        rows.append({
+            "garantia_id": f"W{state['cnt_garantia']:07d}",
+            "cliente_id": v.get("cliente_id", ""),
+            "produto_id": v.get("produto_id", ""),
+            "lote_id": v.get("lote_id", ""),
+            "data_reclamacao": reclamacao_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "dias_pos_venda": to_str(dias),
+            "defeito_id": random.choice(defeitos_sem_d00),
+            "status": "Aprovada",
+            "tempo_resposta_dias": to_str(random.randint(1, 15)),
+            "custo_garantia": to_str(round(random.uniform(200, 1500), 2)),
+        })
 
     return rows
 
@@ -746,7 +830,7 @@ def persist_table(sc, bq_client, dt, run_id, table, rows):
 def executar_simulacao(request):
     args = request.args or {}
 
-    mode = args.get("mode", "incremental").lower()
+    mode = (args.get("mode", "incremental") or "incremental").lower()
     start = args.get("start")  # YYYY-MM-DD
     end = args.get("end")      # YYYY-MM-DD
 
@@ -754,14 +838,22 @@ def executar_simulacao(request):
     sc = gcs()
     state = load_state(sc)
 
-    # seeds determinísticas por state (reprodutível)
-    random.seed(state["seed"])
-    np.random.seed(state["seed"])
+    # seed: evita repetir exatamente os mesmos dados entre execuções
+    base_seed = int(state.get("seed", 42))
+    # mistura run_id de forma simples (determinística na execução)
+    try:
+        mix = int(run_id.split("-")[0], 16) % 100000
+    except Exception:
+        mix = 0
+    seed_this_run = base_seed + mix
+
+    random.seed(seed_this_run)
+    np.random.seed(seed_this_run)
 
     bq_client = bq()
     setup_bq(bq_client)
 
-    # sempre garantir fleet e static 1x
+    # garante fleet e static 1x
     fleet = gen_fleet(state)
 
     # static 1x (vai para GCS; no BQ só ano atual)
@@ -794,13 +886,16 @@ def executar_simulacao(request):
     # -------------------------
     if mode == "backfill":
         if not start or not end:
-            return "ERRO: backfill requer ?start=YYYY-MM-DD&end=YYYY-MM-DD", 400
+            return "ERRO: backfill requer ?mode=backfill&start=YYYY-MM-DD&end=YYYY-MM-DD", 400
 
         try:
             dt1 = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=TZ_BR)
             dt2 = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=TZ_BR)
         except Exception:
             return "ERRO: formato de data inválido. Use YYYY-MM-DD", 400
+
+        if dt2 < dt1:
+            return "ERRO: end < start", 400
 
         cur = dt1
         counts = {k: 0 for k in ["cli","comp","map","prod","lote","qual","vend","gar","man","alt"]}
@@ -809,13 +904,13 @@ def executar_simulacao(request):
             cli = gen_clientes(cur, state)
             comp = gen_compras(cur, state)
 
-            prod, lotes, qual, alt = gen_producao(cur, state, fleet)
+            prod, lotes, qual, alt, lote_to_op = gen_producao(cur, state, fleet)
             mapa = gen_map_lote_compras(lotes, comp)
-            vend = gen_vendas(cur, state, lotes)
+            vend = gen_vendas(cur, state, lotes, lote_to_op)
             gar = gen_garantia(cur, state, vend)
             man = gen_manutencao(cur, state, fleet)
 
-            # grava tudo no lake
+            # grava tudo no lake (GCS)
             for t, rows in [
                 ("raw_cliente", cli),
                 ("raw_compras", comp),
@@ -843,6 +938,8 @@ def executar_simulacao(request):
 
             cur += timedelta(days=1)
 
+        # avança seed para próxima execução variar
+        state["seed"] = base_seed + 1
         save_state(sc, state)
         return f"OK backfill run_id={run_id} | {counts}", 200
 
@@ -856,9 +953,9 @@ def executar_simulacao(request):
         cli = gen_clientes(cur, state)
         comp = gen_compras(cur, state)
 
-        prod, lotes, qual, alt = gen_producao(cur, state, fleet)
+        prod, lotes, qual, alt, lote_to_op = gen_producao(cur, state, fleet)
         mapa = gen_map_lote_compras(lotes, comp)
-        vend = gen_vendas(cur, state, lotes)
+        vend = gen_vendas(cur, state, lotes, lote_to_op)
         gar = gen_garantia(cur, state, vend)
         man = gen_manutencao(cur, state, fleet)
 
@@ -887,5 +984,8 @@ def executar_simulacao(request):
 
         cur += timedelta(hours=1)
 
+    # avança seed para próxima execução variar
+    state["seed"] = base_seed + 1
     save_state(sc, state)
+
     return f"OK incremental run_id={run_id} | {counts}", 200
