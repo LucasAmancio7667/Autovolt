@@ -7,6 +7,10 @@
 # - raw_vendas contém lote_id e ordem_producao_id (corrigido)
 # - raw_cliente recebe eventos de update de data_ultima_compra (opcional, via rows adicionais)
 # - NÃO toca em raw_usuario / raw_controle_acesso
+#
+# UPDATE (2026-02-04):
+# - Seed inicial de clientes (2022 -> hoje) para evitar "head start" do C0001
+# - Escolha balanceada de cliente em vendas (peso por idade + anti-monopólio por janela)
 # =========================
 
 import functions_framework
@@ -37,6 +41,14 @@ TZ_BR = timezone(timedelta(hours=-3))  # America/Recife
 HORAS_POR_LOTE = 1
 
 STATE_FILE = "state/state.json"
+
+# -------------------------
+# CLIENT SEEDING / BALANCE
+# -------------------------
+SEED_CLIENTES_QTD = 800          # ajuste (500-1000 ok)
+ULTIMOS_CLIENTES_JANELA = 200    # janela anti-monopólio
+PESO_INTENSIDADE = 2.2          # >2 favorece antigos; menor = mais uniforme
+PESO_PISO = 0.25                # chance mínima pros mais novos
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -318,6 +330,10 @@ def default_state():
         "cnt_manut": 0,
         "clientes": [],
         "fleet": None,
+
+        # NOVO
+        "clientes_seeded": False,
+        "ultimos_clientes": [],
     }
 
 def load_state(sc: storage.Client) -> dict:
@@ -342,8 +358,18 @@ def load_state(sc: storage.Client) -> dict:
     if state.get("fleet") == []:
         state["fleet"] = None
 
+    # garante listas
+    if state.get("ultimos_clientes") is None:
+        state["ultimos_clientes"] = []
+    if not isinstance(state["ultimos_clientes"], list):
+        state["ultimos_clientes"] = []
+
+    # garante flag
+    if "clientes_seeded" not in state:
+        state["clientes_seeded"] = False
+
     # garante inteiros
-    for k in ["cnt_op","cnt_lote","cnt_venda","cnt_compra","cnt_cliente","cnt_garantia","cnt_manut"]:
+    for k in ["cnt_op", "cnt_lote", "cnt_venda", "cnt_compra", "cnt_cliente", "cnt_garantia", "cnt_manut"]:
         try:
             state[k] = int(state.get(k, 0))
         except Exception:
@@ -417,6 +443,102 @@ def load_bq_from_uri(client: bigquery.Client, table: str, uri: str) -> None:
         f"{PROJECT_ID}.{DATASET_ID}.{table}",
         job_config=job_config,
     ).result()
+
+# -------------------------
+# RUN HELPERS (persist)
+# -------------------------
+def persist_table(sc, bq_client, dt, run_id, table, rows):
+    uri = write_gcs_jsonl(sc, table, rows, run_id, dt)
+    if uri and hot_layer(dt):
+        load_bq_from_uri(bq_client, table, uri)
+
+# -------------------------
+# CLIENT SEED + BALANCE HELPERS
+# -------------------------
+def random_date_between(start_date: datetime, end_date: datetime) -> datetime:
+    """Retorna datetime aleatório entre start_date e end_date (inclusive)."""
+    if end_date <= start_date:
+        return start_date
+    delta = end_date - start_date
+    seconds = int(delta.total_seconds())
+    return start_date + timedelta(seconds=random.randint(0, max(1, seconds)))
+
+def seed_clientes_iniciais(state: dict, dt_now: datetime) -> list[dict]:
+    """
+    Cria um estoque inicial de clientes distribuídos de 2022-01-01 até dt_now.
+    Retorna rows para inserir em raw_cliente (cadastro).
+    """
+    if state.get("clientes_seeded", False):
+        return []
+
+    # Se já tem uma base relevante (ex.: migração anterior), não duplica
+    if len(state.get("clientes", [])) >= 50:
+        state["clientes_seeded"] = True
+        return []
+
+    alvo = int(SEED_CLIENTES_QTD)
+    if alvo <= 0:
+        state["clientes_seeded"] = True
+        return []
+
+    rows = []
+    start = datetime(2022, 1, 1, tzinfo=TZ_BR)
+    end = dt_now
+
+    try:
+        state["cnt_cliente"] = int(state.get("cnt_cliente", 0))
+    except Exception:
+        state["cnt_cliente"] = 0
+
+    for _ in range(alvo):
+        state["cnt_cliente"] += 1
+        cid = f"C{state['cnt_cliente']:04d}"
+        state["clientes"].append(cid)
+
+        dt_cad = random_date_between(start, end).date().isoformat()
+        rows.append({
+            "cliente_id": cid,
+            "tipo_cliente": random.choice(["Distribuidor", "Autopeças", "Montadora"]),
+            "cidade": random.choice(ESTADOS_BR),
+            "tipo_plano": random.choice(["Básico", "Standard", "Premium"]),
+            "data_cadastro": dt_cad,
+            "data_ultima_compra": "",
+        })
+
+    state["clientes_seeded"] = True
+    return rows
+
+def escolher_cliente_por_idade(state: dict) -> str:
+    """
+    Escolhe cliente com peso por 'idade' (posição na lista: mais antigo = mais peso)
+    + anti-monopólio leve usando ultimos_clientes.
+    """
+    clientes = state.get("clientes", [])
+    if not clientes:
+        return ""
+    if len(clientes) < 5:
+        return random.choice(clientes)
+
+    n = len(clientes)
+    weights = []
+    for i in range(n):
+        x = 1 - (i / (n - 1))  # 1 (antigo) -> 0 (novo)
+        w = PESO_PISO + (x ** PESO_INTENSIDADE)
+        weights.append(w)
+
+    ult = state.get("ultimos_clientes", [])[-ULTIMOS_CLIENTES_JANELA:]
+    if ult:
+        freq = {}
+        for c in ult:
+            freq[c] = freq.get(c, 0) + 1
+        limite = max(3, int(0.12 * len(ult)))  # ~12% da janela
+
+        for _ in range(6):
+            c = random.choices(clientes, weights=weights, k=1)[0]
+            if freq.get(c, 0) <= limite:
+                return c
+
+    return random.choices(clientes, weights=weights, k=1)[0]
 
 # -------------------------
 # STATIC BUILDERS
@@ -500,7 +622,7 @@ def calc_oee(dur_h: float, ciclo_min: float, perf: float):
 def gen_clientes(dt: datetime, state: dict):
     rows = []
 
-    # Cliente fundador
+    # Fallback: se por algum motivo não tiver ninguém ainda, cria 1 cliente mínimo e sai
     if not state["clientes"]:
         state["cnt_cliente"] += 1
         cid = f"C{state['cnt_cliente']:04d}"
@@ -510,11 +632,12 @@ def gen_clientes(dt: datetime, state: dict):
             "tipo_cliente": "Distribuidor",
             "cidade": "SP",
             "tipo_plano": "Standard",
-            "data_cadastro": "2022-01-01",
+            "data_cadastro": dt.date().isoformat(),
             "data_ultima_compra": "",
         })
+        return rows
 
-    # ✅ Probabilidade aumentada (principalmente 2025 e ano atual)
+    # Probabilidade de novos clientes (crescimento contínuo)
     ano_atual = datetime.now(TZ_BR).year
     if dt.year <= 2023:
         prob = 0.25
@@ -684,7 +807,13 @@ def gen_vendas(dt: datetime, state: dict, lotes: list[dict], producao: list[dict
 
     for l in amostra:
         state["cnt_venda"] += 1
-        cliente = random.choice(state["clientes"])
+
+        # 🔥 escolha balanceada (idade + anti-monopólio)
+        cliente = escolher_cliente_por_idade(state)
+        if cliente:
+            state.setdefault("ultimos_clientes", []).append(cliente)
+            state["ultimos_clientes"] = state["ultimos_clientes"][-ULTIMOS_CLIENTES_JANELA:]
+
         ordem = op_por_lote.get(l.get("lote_id", ""), "")
 
         rows.append({
@@ -762,14 +891,6 @@ def gen_manutencao(dt: datetime, state: dict, fleet: list[dict]):
     return rows
 
 # -------------------------
-# RUN HELPERS (persist)
-# -------------------------
-def persist_table(sc, bq_client, dt, run_id, table, rows):
-    uri = write_gcs_jsonl(sc, table, rows, run_id, dt)
-    if uri and hot_layer(dt):
-        load_bq_from_uri(bq_client, table, uri)
-
-# -------------------------
 # MAIN HANDLER
 # -------------------------
 @functions_framework.http
@@ -790,6 +911,15 @@ def executar_simulacao(request):
 
     bq_client = bq()
     setup_bq(bq_client)
+
+    # -------------------------
+    # SEED inicial de clientes (1x)
+    # -------------------------
+    now_seed = datetime.now(TZ_BR)
+    seed_rows = seed_clientes_iniciais(state, now_seed)
+    if seed_rows:
+        persist_table(sc, bq_client, now_seed, run_id, "raw_cliente", seed_rows)
+        save_state(sc, state)
 
     # garante fleet e static 1x
     fleet = gen_fleet(state)
@@ -833,7 +963,7 @@ def executar_simulacao(request):
             return "ERRO: formato de data inválido. Use YYYY-MM-DD", 400
 
         cur = dt1
-        counts = {k: 0 for k in ["cli","cli_upd","comp","map","prod","lote","qual","vend","gar","man","alt"]}
+        counts = {k: 0 for k in ["cli", "cli_upd", "comp", "map", "prod", "lote", "qual", "vend", "gar", "man", "alt"]}
 
         while cur <= dt2:
             cli = gen_clientes(cur, state)
@@ -884,7 +1014,7 @@ def executar_simulacao(request):
     # INCREMENTAL (GCS + BQ ano atual)
     # -------------------------
     cur = datetime.now(TZ_BR)
-    counts = {k: 0 for k in ["cli","cli_upd","comp","map","prod","lote","qual","vend","gar","man","alt"]}
+    counts = {k: 0 for k in ["cli", "cli_upd", "comp", "map", "prod", "lote", "qual", "vend", "gar", "man", "alt"]}
 
     for _ in range(HORAS_POR_LOTE):
         cli = gen_clientes(cur, state)
