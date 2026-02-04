@@ -4,9 +4,9 @@
 # - BigQuery "hot layer" só ano atual (economia/free)
 # - Histórico (backfill) grava só no GCS
 # - Estado em state/state.json (migração automática)
-# - raw_vendas contém lote_id e ordem_producao_id (preenchido)
+# - raw_vendas contém lote_id + ordem_producao_id (via mapeamento lote->OP)
+# - raw_cliente é append-only (auditável): gera nova linha com data_ultima_compra quando houver venda
 # - NÃO toca em raw_usuario / raw_controle_acesso
-# - Replay do lake (bucket) -> BigQuery sem SQL (action=replay)
 # =========================
 
 import functions_framework
@@ -171,7 +171,7 @@ SCHEMAS = {
         SchemaField("cliente_id", "STRING"),
         SchemaField("produto_id", "STRING"),
         SchemaField("ordem_producao_id", "STRING"),
-        SchemaField("lote_id", "STRING"),
+        SchemaField("lote_id", "STRING"),  # pedido do PBI
         SchemaField("data_venda", "STRING"),
         SchemaField("quantidade_vendida", "STRING"),
         SchemaField("valor_total_venda", "STRING"),
@@ -317,6 +317,7 @@ def default_state():
         "cnt_garantia": 0,
         "cnt_manut": 0,
         "clientes": [],
+        "clientes_dim": {},   # <-- mantém atributos do cliente para updates append-only
         "fleet": None,
     }
 
@@ -339,11 +340,13 @@ def load_state(sc: storage.Client) -> dict:
     # saneamento
     if state.get("clientes") is None:
         state["clientes"] = []
+    if state.get("clientes_dim") is None:
+        state["clientes_dim"] = {}
     if state.get("fleet") == []:
         state["fleet"] = None
 
     # garante inteiros
-    for k in ["cnt_op","cnt_lote","cnt_venda","cnt_compra","cnt_cliente","cnt_garantia","cnt_manut"]:
+    for k in ["cnt_op","cnt_lote","cnt_venda","cnt_compra","cnt_cliente","cnt_garantia","cnt_manut","seed"]:
         try:
             state[k] = int(state.get(k, 0))
         except Exception:
@@ -374,7 +377,7 @@ def turno(dt: datetime) -> str:
     return "T3"
 
 def hot_layer(dt: datetime) -> bool:
-    # só carrega pro BQ dados do ano atual
+    # só carrega pro BQ dados do ano atual (economia)
     return dt.year == datetime.now(TZ_BR).year
 
 def write_gcs_jsonl(sc: storage.Client, table: str, rows: list[dict], run_id: str, dt: datetime) -> str:
@@ -395,7 +398,8 @@ def write_gcs_jsonl(sc: storage.Client, table: str, rows: list[dict], run_id: st
         buf.write(json.dumps(rr, ensure_ascii=False))
         buf.write("\n")
 
-    blob = sc.bucket(BUCKET_NAME).blob(blob_name)
+    bucket = sc.bucket(BUCKET_NAME)
+    blob = bucket.blob(blob_name)
     blob.upload_from_string(buf.getvalue(), content_type="application/json")
 
     return f"gs://{BUCKET_NAME}/{blob_name}"
@@ -408,7 +412,7 @@ def load_bq_from_uri(client: bigquery.Client, table: str, uri: str) -> None:
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         schema=SCHEMAS[table],
         write_disposition="WRITE_APPEND",
-        ignore_unknown_values=True,
+        ignore_unknown_values=True,  # ignora _run_id / _ingested_at
     )
 
     client.load_table_from_uri(
@@ -504,34 +508,41 @@ def gen_clientes(dt: datetime, state: dict):
         state["cnt_cliente"] += 1
         cid = f"C{state['cnt_cliente']:04d}"
         state["clientes"].append(cid)
-        rows.append({
+
+        rec = {
             "cliente_id": cid,
             "tipo_cliente": "Distribuidor",
             "cidade": "SP",
             "tipo_plano": "Standard",
             "data_cadastro": "2022-01-01",
             "data_ultima_compra": "",
-        })
+        }
+        state["clientes_dim"][cid] = rec
+        rows.append(rec)
 
-    # Crescimento
+    # Entrada de clientes ao longo do tempo
     prob = 0.20 if dt.year <= 2023 else 0.08 if dt.year == 2024 else 0.04
     if random.random() < prob:
         state["cnt_cliente"] += 1
         cid = f"C{state['cnt_cliente']:04d}"
         state["clientes"].append(cid)
-        rows.append({
+
+        rec = {
             "cliente_id": cid,
             "tipo_cliente": random.choice(["Distribuidor", "Autopeças", "Montadora"]),
             "cidade": random.choice(ESTADOS_BR),
             "tipo_plano": random.choice(["Básico", "Standard", "Premium"]),
             "data_cadastro": dt.date().isoformat(),
             "data_ultima_compra": "",
-        })
+        }
+        state["clientes_dim"][cid] = rec
+        rows.append(rec)
 
     return rows
 
 def gen_compras(dt: datetime, state: dict):
     rows = []
+
     prob = 0.55 if dt.year <= 2023 else 0.45 if dt.year == 2024 else 0.35
     if random.random() >= prob:
         return rows
@@ -580,7 +591,7 @@ def gen_producao(dt: datetime, state: dict, fleet: list[dict]):
         fim = dt + timedelta(hours=dur)
 
         pid = random.choice(produtos)
-        ciclo_nom = 0.5
+        ciclo_nom = 0.5  # 30s
         q_plan, q_prod, q_ref = calc_oee(dur, ciclo_nom, perf)
 
         lotes.append({
@@ -623,10 +634,12 @@ def gen_producao(dt: datetime, state: dict, fleet: list[dict]):
             "aprovado": "1" if q_prod > 0 else "0",
         })
 
+        # alerta (ML-ready)
         if temp > 100.0 or vib > 2000.0:
             alerts.append({
                 "alerta_id": f"ALT-{uuid.uuid4().hex[:10]}",
-                "data_ocorrencia": dt.isoformat(),  # TIMESTAMP parseável
+                # BQ TIMESTAMP aceita string RFC3339/ISO
+                "data_ocorrencia": dt.isoformat(),
                 "nivel": "CRITICO",
                 "maquina_id": m["maquina_id"],
                 "mensagem": "Anomalia Detectada",
@@ -651,24 +664,34 @@ def gen_map_lote_compras(lotes: list[dict], compras: list[dict]):
     return rows
 
 def gen_vendas(dt: datetime, state: dict, lotes: list[dict], producao: list[dict]):
-    rows = []
-    if not lotes or not state["clientes"] or not producao:
-        return rows
+    """
+    Retorna:
+      - vendas (raw_vendas): inclui ordem_producao_id preenchido via mapeamento lote->OP
+      - cliente_updates (raw_cliente): append-only com data_ultima_compra preenchida (auditável)
+    """
+    vendas = []
+    cliente_updates = []
 
-    # mapa lote -> op (para preencher ordem_producao_id corretamente)
+    if not lotes or not state["clientes"] or not producao:
+        return vendas, cliente_updates
+
     lote_to_op = {p["lote_id"]: p["ordem_producao_id"] for p in producao}
 
+    # vende ~20% dos lotes, mínimo 1
     n = max(1, len(lotes) // 5)
     amostra = lotes[:n]
 
+    updated_clients = set()
+
     for l in amostra:
         state["cnt_venda"] += 1
+        cid = random.choice(state["clientes"])
         op_id = lote_to_op.get(l["lote_id"], "")
 
-        rows.append({
+        vendas.append({
             "venda_id": f"V{state['cnt_venda']:07d}",
             "ano_mes_id": dt.strftime("%Y-%m"),
-            "cliente_id": random.choice(state["clientes"]),
+            "cliente_id": cid,
             "produto_id": l["produto_id"],
             "ordem_producao_id": op_id,
             "lote_id": l["lote_id"],
@@ -676,17 +699,28 @@ def gen_vendas(dt: datetime, state: dict, lotes: list[dict], producao: list[dict
             "quantidade_vendida": to_str(random.randint(20, 120)),
             "valor_total_venda": to_str(round(random.uniform(5000, 15000), 2)),
         })
-    return rows
+
+        # append-only: cria nova linha de cliente com data_ultima_compra atualizada
+        if cid in state["clientes_dim"] and cid not in updated_clients:
+            state["clientes_dim"][cid]["data_ultima_compra"] = dt.date().isoformat()
+            cliente_updates.append(dict(state["clientes_dim"][cid]))
+            updated_clients.add(cid)
+
+    return vendas, cliente_updates
 
 def gen_garantia(dt: datetime, state: dict, vendas: list[dict]):
+    """
+    Gera garantias a partir das vendas do período.
+    Observação: data_reclamacao fica dt + [1..90] dias (simula atraso real).
+    """
     rows = []
     if not vendas:
         return rows
 
+    defeitos = [d["defeito_id"] for d in DADOS_ESTATICOS["raw_defeito"]]
+
     for v in vendas:
-        # aumenta um pouco a chance no backfill pra ficar mais visível
-        prob = 0.02 if dt.year <= 2025 else 0.01
-        if random.random() < prob:
+        if random.random() < 0.01:
             state["cnt_garantia"] += 1
             dias = random.randint(1, 90)
             status = random.choice(["Aprovada", "Negada", "Negada - Mau Uso"])
@@ -699,7 +733,7 @@ def gen_garantia(dt: datetime, state: dict, vendas: list[dict]):
                 "lote_id": v["lote_id"],
                 "data_reclamacao": (dt + timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S"),
                 "dias_pos_venda": to_str(dias),
-                "defeito_id": random.choice(["D00","D01","D02","D03","D04","D05"]),
+                "defeito_id": random.choice(defeitos),
                 "status": status,
                 "tempo_resposta_dias": to_str(random.randint(1, 15)),
                 "custo_garantia": to_str(custo),
@@ -736,135 +770,13 @@ def persist_table(sc, bq_client, dt, run_id, table, rows):
         load_bq_from_uri(bq_client, table, uri)
 
 # -------------------------
-# REPLAY (Lake -> BQ) sem SQL / sem tabela nova
-# -------------------------
-ALLOWED_REPLAY_TABLES = {
-    "raw_cliente",
-    "raw_vendas",
-    "raw_garantia",
-    "raw_producao",
-    "raw_lote",
-    "raw_qualidade",
-    "raw_compras",
-    "raw_map_lote_compras",
-    "raw_manutencao",
-    "monitoramento_alertas",
-}
-
-def _schema_fieldnames(table: str) -> set:
-    return {f.name for f in SCHEMAS[table]}
-
-def _coerce_row_to_bronze(table: str, row: dict) -> dict:
-    keep = _schema_fieldnames(table)
-    out = {}
-
-    for k in keep:
-        v = row.get(k, None)
-
-        if table == "monitoramento_alertas":
-            if k == "valor_medido":
-                try:
-                    out[k] = float(v) if v not in (None, "") else None
-                except Exception:
-                    out[k] = None
-            else:
-                out[k] = None if v in (None, "") else str(v)
-        else:
-            out[k] = "" if v is None else str(v)
-
-    return out
-
-def _iter_jsonl_from_gcs(bucket: storage.Bucket, blob_name: str):
-    blob = bucket.blob(blob_name)
-    with blob.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
-
-def _list_blobs_for_year(sc: storage.Client, table: str, year: int) -> list:
-    prefix = f"bronze/{table}/dt={year}-"
-    blobs = sc.list_blobs(BUCKET_NAME, prefix=prefix)
-    return [b.name for b in blobs if b.name.endswith(".jsonl")]
-
-def _insert_rows_json(client: bigquery.Client, table: str, rows: list[dict]) -> int:
-    if not rows:
-        return 0
-
-    table_ref = f"{PROJECT_ID}.{DATASET_ID}.{table}"
-    errors = client.insert_rows_json(table_ref, rows)
-    if errors:
-        raise RuntimeError(f"Erros ao inserir em {table}: {errors[:3]}")
-    return len(rows)
-
-def replay_from_bucket(request, sc: storage.Client, bq_client: bigquery.Client):
-    args = request.args or {}
-    table = (args.get("table") or "").strip()
-    year = int(args.get("year") or 0)
-    limit = int(args.get("limit") or 0)   # 0 = sem limite
-    batch = int(args.get("batch") or 500)
-
-    if table not in ALLOWED_REPLAY_TABLES:
-        return f"ERRO: table inválida. Use uma de: {sorted(ALLOWED_REPLAY_TABLES)}", 400
-    if year < 2000 or year > 2100:
-        return "ERRO: year inválido", 400
-
-    setup_bq(bq_client)
-
-    blob_names = _list_blobs_for_year(sc, table, year)
-    if not blob_names:
-        return f"Nenhum arquivo encontrado para {table} em {year} no bucket.", 404
-
-    bucket = sc.bucket(BUCKET_NAME)
-
-    inserted = 0
-    files = 0
-    buf = []
-
-    for bn in blob_names:
-        files += 1
-        for raw in _iter_jsonl_from_gcs(bucket, bn):
-            # remove metadados do lake e normaliza pro schema bronze
-            row = _coerce_row_to_bronze(table, raw)
-            buf.append(row)
-
-            if len(buf) >= batch:
-                _insert_rows_json(bq_client, table, buf)
-                inserted += len(buf)
-                buf.clear()
-
-                if limit and inserted >= limit:
-                    break
-        if limit and inserted >= limit:
-            break
-
-    if buf and (not limit or inserted < limit):
-        _insert_rows_json(bq_client, table, buf)
-        inserted += len(buf)
-        buf.clear()
-
-    return f"OK replay table={table} year={year} files={files} inserted={inserted}", 200
-
-# -------------------------
 # MAIN HANDLER
 # -------------------------
 @functions_framework.http
 def executar_simulacao(request):
     args = request.args or {}
 
-    # Replay (sem SQL)
-    if (args.get("action") or "").lower() == "replay":
-        sc = gcs()
-        bq_client = bq()
-        try:
-            return replay_from_bucket(request, sc, bq_client)
-        except Exception as e:
-            msg = f"❌ ERRO REPLAY: {str(e)}"
-            logging.exception(msg)
-            return msg, 500
-
-    mode = (args.get("mode") or "incremental").lower()
+    mode = args.get("mode", "incremental").lower()
     start = args.get("start")  # YYYY-MM-DD
     end = args.get("end")      # YYYY-MM-DD
 
@@ -872,7 +784,7 @@ def executar_simulacao(request):
     sc = gcs()
     state = load_state(sc)
 
-    # seeds determinísticas por state
+    # seeds determinísticas por state (reprodutível)
     random.seed(state["seed"])
     np.random.seed(state["seed"])
 
@@ -912,7 +824,7 @@ def executar_simulacao(request):
     # -------------------------
     if mode == "backfill":
         if not start or not end:
-            return "ERRO: backfill requer ?start=YYYY-MM-DD&end=YYYY-MM-DD", 400
+            return "ERRO: backfill requer ?mode=backfill&start=YYYY-MM-DD&end=YYYY-MM-DD", 400
 
         try:
             dt1 = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=TZ_BR)
@@ -921,7 +833,7 @@ def executar_simulacao(request):
             return "ERRO: formato de data inválido. Use YYYY-MM-DD", 400
 
         cur = dt1
-        counts = {k: 0 for k in ["cli","comp","map","prod","lote","qual","vend","gar","man","alt"]}
+        counts = {k: 0 for k in ["cli","cli_upd","comp","map","prod","lote","qual","vend","gar","man","alt"]}
 
         while cur <= dt2:
             cli = gen_clientes(cur, state)
@@ -929,12 +841,14 @@ def executar_simulacao(request):
 
             prod, lotes, qual, alt = gen_producao(cur, state, fleet)
             mapa = gen_map_lote_compras(lotes, comp)
-            vend = gen_vendas(cur, state, lotes, prod)
+
+            vend, cli_upd = gen_vendas(cur, state, lotes, prod)
             gar = gen_garantia(cur, state, vend)
             man = gen_manutencao(cur, state, fleet)
 
+            # grava tudo no lake (GCS)
             for t, rows in [
-                ("raw_cliente", cli),
+                ("raw_cliente", cli + cli_upd),
                 ("raw_compras", comp),
                 ("raw_map_lote_compras", mapa),
                 ("raw_producao", prod),
@@ -948,6 +862,7 @@ def executar_simulacao(request):
                 write_gcs_jsonl(sc, t, rows, run_id, cur)
 
             counts["cli"] += len(cli)
+            counts["cli_upd"] += len(cli_upd)
             counts["comp"] += len(comp)
             counts["map"] += len(mapa)
             counts["prod"] += len(prod)
@@ -960,6 +875,8 @@ def executar_simulacao(request):
 
             cur += timedelta(days=1)
 
+        # muda seed pra próxima execução não repetir dados
+        state["seed"] = (state["seed"] + 1) % 1_000_000_000
         save_state(sc, state)
         return f"OK backfill run_id={run_id} | {counts}", 200
 
@@ -967,7 +884,7 @@ def executar_simulacao(request):
     # INCREMENTAL (GCS + BQ ano atual)
     # -------------------------
     cur = datetime.now(TZ_BR)
-    counts = {k: 0 for k in ["cli","comp","map","prod","lote","qual","vend","gar","man","alt"]}
+    counts = {k: 0 for k in ["cli","cli_upd","comp","map","prod","lote","qual","vend","gar","man","alt"]}
 
     for _ in range(HORAS_POR_LOTE):
         cli = gen_clientes(cur, state)
@@ -975,11 +892,13 @@ def executar_simulacao(request):
 
         prod, lotes, qual, alt = gen_producao(cur, state, fleet)
         mapa = gen_map_lote_compras(lotes, comp)
-        vend = gen_vendas(cur, state, lotes, prod)
+
+        vend, cli_upd = gen_vendas(cur, state, lotes, prod)
         gar = gen_garantia(cur, state, vend)
         man = gen_manutencao(cur, state, fleet)
 
-        persist_table(sc, bq_client, cur, run_id, "raw_cliente", cli)
+        # persiste no GCS sempre; carrega no BQ só ano atual
+        persist_table(sc, bq_client, cur, run_id, "raw_cliente", cli + cli_upd)
         persist_table(sc, bq_client, cur, run_id, "raw_compras", comp)
         persist_table(sc, bq_client, cur, run_id, "raw_map_lote_compras", mapa)
         persist_table(sc, bq_client, cur, run_id, "raw_producao", prod)
@@ -991,6 +910,7 @@ def executar_simulacao(request):
         persist_table(sc, bq_client, cur, run_id, "monitoramento_alertas", alt)
 
         counts["cli"] += len(cli)
+        counts["cli_upd"] += len(cli_upd)
         counts["comp"] += len(comp)
         counts["map"] += len(mapa)
         counts["prod"] += len(prod)
@@ -1003,5 +923,7 @@ def executar_simulacao(request):
 
         cur += timedelta(hours=1)
 
+    # muda seed pra próxima execução não repetir dados
+    state["seed"] = (state["seed"] + 1) % 1_000_000_000
     save_state(sc, state)
     return f"OK incremental run_id={run_id} | {counts}", 200
