@@ -619,10 +619,10 @@ def calc_oee(dur_h: float, ciclo_min: float, perf: float):
 # -------------------------
 # GENERATORS (negócio)
 # -------------------------
-def gen_clientes(dt: datetime, state: dict):
+def gen_clientes(dt: datetime, state: dict, passo_horas: int = 1):
     rows = []
 
-    # Fallback: se por algum motivo não tiver ninguém ainda, cria 1 cliente mínimo e sai
+    # Cliente fundador
     if not state["clientes"]:
         state["cnt_cliente"] += 1
         cid = f"C{state['cnt_cliente']:04d}"
@@ -632,38 +632,33 @@ def gen_clientes(dt: datetime, state: dict):
             "tipo_cliente": "Distribuidor",
             "cidade": "SP",
             "tipo_plano": "Standard",
-            "data_cadastro": dt.date().isoformat(),
-            "data_ultima_compra": "",
+            "data_cadastro": "2022-01-01",
         })
-        return rows
 
-    # Probabilidade de novos clientes (crescimento contínuo)
-    ano_atual = datetime.now(TZ_BR).year
-    if dt.year <= 2023:
-        prob = 0.25
-    elif dt.year == 2024:
-        prob = 0.18
-    elif dt.year == 2025:
-        prob = 0.14
-    elif dt.year == ano_atual:
-        prob = 0.18
-    else:
-        prob = 0.10
+    # Média desejada: 1 cliente a cada 4h => 0.25/h
+    lambda_por_hora = 0.25
 
-    if random.random() < prob:
+    # Quantos clientes surgem neste passo (aleatório, média controlada)
+    qtd_novos = int(np.random.poisson(lam=lambda_por_hora * passo_horas))
+
+    # Limite de segurança (evita picos irreais)
+    qtd_novos = min(qtd_novos, 10)
+
+    for _ in range(qtd_novos):
         state["cnt_cliente"] += 1
         cid = f"C{state['cnt_cliente']:04d}"
         state["clientes"].append(cid)
+
         rows.append({
             "cliente_id": cid,
             "tipo_cliente": random.choice(["Distribuidor", "Autopeças", "Montadora"]),
             "cidade": random.choice(ESTADOS_BR),
             "tipo_plano": random.choice(["Básico", "Standard", "Premium"]),
             "data_cadastro": dt.date().isoformat(),
-            "data_ultima_compra": "",
         })
 
     return rows
+
 
 def gen_compras(dt: datetime, state: dict):
     rows = []
@@ -835,27 +830,97 @@ def gen_garantia(dt: datetime, state: dict, vendas: list[dict]):
     if not vendas:
         return rows
 
-    for v in vendas:
-        if random.random() < 0.01:
-            state["cnt_garantia"] += 1
-            dias = random.randint(1, 90)
-            status = random.choice(["Aprovada", "Negada", "Negada - Mau Uso"])
-            custo = round(random.uniform(200, 3000), 2) if "Aprovada" in status else 0.0
+    # Janela de garantia (em dias) - ajuste se quiser
+    GARANTIA_DIAS = 180
 
-            rows.append({
-                "garantia_id": f"W{state['cnt_garantia']:07d}",
-                "cliente_id": v["cliente_id"],
-                "produto_id": v["produto_id"],
-                "lote_id": v["lote_id"],
-                "data_reclamacao": (dt + timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S"),
-                "dias_pos_venda": to_str(dias),
-                "defeito_id": "D00",
-                "status": status,
-                "tempo_resposta_dias": to_str(random.randint(1, 15)),
-                "custo_garantia": to_str(custo),
-            })
+    # Pesos realistas (inclui "não procede" = D00)
+    # Soma não precisa dar 1.0, é só peso relativo
+    defeitos_pesos = [
+        ("D00", 0.25),  # não procede / sem defeito (bem comum em garantia)
+        ("D05", 0.22),  # terminal oxidado (baixa)
+        ("D02", 0.20),  # baixa tensão (média)
+        ("D03", 0.16),  # caixa rachada (média; muitas vezes mau uso)
+        ("D01", 0.12),  # vazamento de ácido (alta)
+        ("D04", 0.05),  # curto/sobreaquecimento (crítica)
+    ]
+
+    # Mapeia severidade pra custo base (quando aprovada)
+    custo_base = {
+        "D05": (150, 600),
+        "D02": (250, 1200),
+        "D03": (200, 1000),
+        "D01": (500, 2200),
+        "D04": (900, 4000),
+    }
+
+    # Defeitos com maior chance de "mau uso"
+    mau_uso_prob = {
+        "D03": 0.55,  # caixa rachada: transporte/instalação ruim
+        "D05": 0.18,  # oxidado: ambiente/instalação
+        "D02": 0.10,  # baixa tensão: alternador/uso
+        "D01": 0.08,  # vazamento: pode ser instalação
+        "D04": 0.06,  # curto: pode ser mau uso também
+    }
+
+    defeitos_ids = [d for d, _ in defeitos_pesos]
+    defeitos_w = [w for _, w in defeitos_pesos]
+
+    for v in vendas:
+        # taxa de acionamento de garantia (você já tinha 1%)
+        if random.random() >= 0.01:
+            continue
+
+        state["cnt_garantia"] += 1
+        dias = random.randint(1, 90)  # seu range atual; se quiser mais real, pode aumentar
+        defeito_id = random.choices(defeitos_ids, weights=defeitos_w, k=1)[0]
+
+        # Regras de decisão
+        dentro_garantia = dias <= GARANTIA_DIAS
+
+        if defeito_id == "D00":
+            status = "Negada"
+            custo = 0.0
+        else:
+            # chance de mau uso depende do defeito e aumenta com o tempo
+            p_mau = mau_uso_prob.get(defeito_id, 0.10)
+            if dias > 60:
+                p_mau = min(0.85, p_mau + 0.10)  # levemente maior depois de 60 dias
+            if dias > 120:
+                p_mau = min(0.90, p_mau + 0.10)
+
+            if random.random() < p_mau:
+                status = "Negada - Mau Uso"
+                custo = 0.0
+            else:
+                if dentro_garantia:
+                    status = "Aprovada"
+                    lo, hi = custo_base.get(defeito_id, (200, 1500))
+                    custo = round(random.uniform(lo, hi), 2)
+                else:
+                    # Fora da garantia: normalmente nega, mas pode ter "boa vontade"
+                    if random.random() < 0.08:
+                        status = "Aprovada"
+                        lo, hi = custo_base.get(defeito_id, (200, 1500))
+                        custo = round(random.uniform(lo, hi), 2)
+                    else:
+                        status = "Negada"
+                        custo = 0.0
+
+        rows.append({
+            "garantia_id": f"W{state['cnt_garantia']:07d}",
+            "cliente_id": v["cliente_id"],
+            "produto_id": v["produto_id"],
+            "lote_id": v["lote_id"],
+            "data_reclamacao": (dt + timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S"),
+            "dias_pos_venda": to_str(dias),
+            "defeito_id": defeito_id,
+            "status": status,
+            "tempo_resposta_dias": to_str(random.randint(1, 15)),
+            "custo_garantia": to_str(custo),
+        })
 
     return rows
+
 
 def gen_manutencao(dt: datetime, state: dict, fleet: list[dict]):
     rows = []
@@ -953,7 +1018,7 @@ def executar_simulacao(request):
         counts = {k: 0 for k in ["cli", "comp", "map", "prod", "lote", "qual", "vend", "gar", "man", "alt"]}
 
         while cur <= dt2:
-            cli = gen_clientes(cur, state)
+            cli = gen_clientes(cur, state, passo_horas=24)
             comp = gen_compras(cur, state)
 
             prod, lotes, qual, alt = gen_producao(cur, state, fleet)
@@ -1002,7 +1067,7 @@ def executar_simulacao(request):
     counts = {k: 0 for k in ["cli", "comp", "map", "prod", "lote", "qual", "vend", "gar", "man", "alt"]}
 
     for _ in range(HORAS_POR_LOTE):
-        cli = gen_clientes(cur, state)
+        cli = gen_clientes(cur, state, passo_horas=1)
         comp = gen_compras(cur, state)
 
         prod, lotes, qual, alt = gen_producao(cur, state, fleet)
