@@ -803,12 +803,10 @@ def gen_vendas(dt: datetime, state: dict, lotes: list[dict], producao: list[dict
     n = max(1, len(lotes) // 5)
     amostra = lotes[:n]
 
-    cliente_updates = []
-
     for l in amostra:
         state["cnt_venda"] += 1
 
-        # 🔥 escolha balanceada (idade + anti-monopólio)
+        # Escolha balanceada (mantém sua lógica atual)
         cliente = escolher_cliente_por_idade(state)
         if cliente:
             state.setdefault("ultimos_clientes", []).append(cliente)
@@ -821,26 +819,15 @@ def gen_vendas(dt: datetime, state: dict, lotes: list[dict], producao: list[dict
             "ano_mes_id": dt.strftime("%Y-%m"),
             "cliente_id": cliente,
             "produto_id": l["produto_id"],
-            "ordem_producao_id": ordem,   # ✅ preenchido
+            "ordem_producao_id": ordem,
             "lote_id": l["lote_id"],
             "data_venda": dt.date().isoformat(),
             "quantidade_vendida": to_str(random.randint(20, 120)),
             "valor_total_venda": to_str(round(random.uniform(5000, 15000), 2)),
         })
 
-        # evento "update" do cliente (mesmo schema, outros campos vazios)
-        cliente_updates.append({
-            "cliente_id": cliente,
-            "tipo_cliente": "",
-            "cidade": "",
-            "tipo_plano": "",
-            "data_cadastro": "",
-            "data_ultima_compra": dt.date().isoformat(),
-        })
-
-    # stash transitório pra persistir junto de raw_cliente
-    state["_cliente_updates"] = cliente_updates
     return rows
+
 
 # ✅ garantia sempre baseada em venda
 def gen_garantia(dt: datetime, state: dict, vendas: list[dict]):
@@ -973,14 +960,13 @@ def executar_simulacao(request):
             mapa = gen_map_lote_compras(lotes, comp)
 
             vend = gen_vendas(cur, state, lotes, prod)
-            cli_updates = state.pop("_cliente_updates", [])
 
             gar = gen_garantia(cur, state, vend)
             man = gen_manutencao(cur, state, fleet)
 
             # grava tudo no lake (GCS)
             for t, rows in [
-                ("raw_cliente", cli + cli_updates),
+                ("raw_cliente", cli),
                 ("raw_compras", comp),
                 ("raw_map_lote_compras", mapa),
                 ("raw_producao", prod),
@@ -1024,13 +1010,12 @@ def executar_simulacao(request):
         mapa = gen_map_lote_compras(lotes, comp)
 
         vend = gen_vendas(cur, state, lotes, prod)
-        cli_updates = state.pop("_cliente_updates", [])
 
         gar = gen_garantia(cur, state, vend)
         man = gen_manutencao(cur, state, fleet)
 
         # persiste no GCS sempre; carrega no BQ só ano atual
-        persist_table(sc, bq_client, cur, run_id, "raw_cliente", cli + cli_updates)
+        persist_table(sc, bq_client, cur, run_id, "raw_cliente", cli)
         persist_table(sc, bq_client, cur, run_id, "raw_compras", comp)
         persist_table(sc, bq_client, cur, run_id, "raw_map_lote_compras", mapa)
         persist_table(sc, bq_client, cur, run_id, "raw_producao", prod)
