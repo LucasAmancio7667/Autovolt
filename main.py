@@ -950,7 +950,7 @@ def executar_simulacao(request):
             return "ERRO: formato de data inválido. Use YYYY-MM-DD", 400
 
         cur = dt1
-        counts = {k: 0 for k in ["cli", "cli_upd", "comp", "map", "prod", "lote", "qual", "vend", "gar", "man", "alt"]}
+        counts = {k: 0 for k in ["cli", "comp", "map", "prod", "lote", "qual", "vend", "gar", "man", "alt"]}
 
         while cur <= dt2:
             cli = gen_clientes(cur, state)
@@ -980,7 +980,6 @@ def executar_simulacao(request):
                 write_gcs_jsonl(sc, t, rows, run_id, cur)
 
             counts["cli"] += len(cli)
-            counts["cli_upd"] += len(cli_updates)
             counts["comp"] += len(comp)
             counts["map"] += len(mapa)
             counts["prod"] += len(prod)
@@ -1000,7 +999,7 @@ def executar_simulacao(request):
     # INCREMENTAL (GCS + BQ ano atual)
     # -------------------------
     cur = datetime.now(TZ_BR)
-    counts = {k: 0 for k in ["cli", "cli_upd", "comp", "map", "prod", "lote", "qual", "vend", "gar", "man", "alt"]}
+    counts = {k: 0 for k in ["cli", "comp", "map", "prod", "lote", "qual", "vend", "gar", "man", "alt"]}
 
     for _ in range(HORAS_POR_LOTE):
         cli = gen_clientes(cur, state)
@@ -1027,7 +1026,6 @@ def executar_simulacao(request):
         persist_table(sc, bq_client, cur, run_id, "monitoramento_alertas", alt)
 
         counts["cli"] += len(cli)
-        counts["cli_upd"] += len(cli_updates)
         counts["comp"] += len(comp)
         counts["map"] += len(mapa)
         counts["prod"] += len(prod)
