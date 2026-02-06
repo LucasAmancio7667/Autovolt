@@ -956,6 +956,8 @@ def executar_simulacao(request):
     state = load_state(sc)
 
     # seeds determinísticas por state
+    state["seed"] = int(state.get("seed", 42)) + 1
+    
     random.seed(state["seed"])
     np.random.seed(state["seed"])
 
