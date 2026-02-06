@@ -125,7 +125,6 @@ SCHEMAS = {
         SchemaField("cidade", "STRING"),
         SchemaField("tipo_plano", "STRING"),
         SchemaField("data_cadastro", "STRING"),
-        SchemaField("data_ultima_compra", "STRING"),
     ],
     "raw_lote": [
         SchemaField("lote_id", "STRING"),
@@ -502,7 +501,6 @@ def seed_clientes_iniciais(state: dict, dt_now: datetime) -> list[dict]:
             "cidade": random.choice(ESTADOS_BR),
             "tipo_plano": random.choice(["Básico", "Standard", "Premium"]),
             "data_cadastro": dt_cad,
-            "data_ultima_compra": "",
         })
 
     state["clientes_seeded"] = True
