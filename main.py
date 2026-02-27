@@ -22,8 +22,7 @@ import json
 import uuid
 import random
 import logging
-from datetime import datetime, timedelta, timezone
-
+from datetime import datetime, timedelta, timezone, date
 import numpy as np
 from google.cloud import bigquery
 from google.cloud import storage
