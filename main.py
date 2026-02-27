@@ -30,6 +30,16 @@ from google.cloud import storage
 from google.cloud.bigquery import SchemaField
 from google.api_core.exceptions import NotFound
 
+class CompactJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat() # Converte data para "2026-02-27"
+        if isinstance(obj, np.integer):
+            return int(obj) # Converte int64 para int comum
+        if isinstance(obj, np.floating):
+            return float(obj) # Converte float64 para float comum
+        return super().default(obj)
+        
 # -------------------------
 # CONFIG
 # -------------------------
@@ -417,7 +427,7 @@ def write_gcs_jsonl(sc: storage.Client, table: str, rows: list[dict], run_id: st
         rr = dict(r)
         rr["_run_id"] = run_id
         rr["_ingested_at"] = ingest_ts
-        buf.write(json.dumps(rr, ensure_ascii=False))
+        buf.write(json.dumps(rr, ensure_ascii=False, cls=CompactJSONEncoder))
         buf.write("\n")
 
     bucket = sc.bucket(BUCKET_NAME)
