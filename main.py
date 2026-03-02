@@ -1033,8 +1033,20 @@ def executar_simulacao(request):
             prod, lotes, qual, alt = gen_producao(cur, state, fleet)
             mapa = gen_map_lote_compras(lotes, comp)
 
-            vend = gen_vendas(cur, state, lotes, prod)
+            # --- INÍCIO DA SUBSTITUIÇÃO / AJUSTE PARA ML ---
+            if not alt and random.random() < 0.15:
+                m_random = random.choice(fleet)
+                alt.append({
+                    "alerta_id": f"ALT-HIST-{uuid.uuid4().hex[:6]}",
+                    "data_ocorrencia": cur,
+                    "nivel": "CRITICO",
+                    "maquina_id": m_random["maquina_id"],
+                    "mensagem": "Anomalia Histórica Injetada para Treino",
+                    "valor_medido": float(random.uniform(102.0, 115.0)) # Força valor acima do limite
+                })
+            # --- FIM DA SUBSTITUIÇÃO ---
 
+            vend = gen_vendas(cur, state, lotes, prod)
             gar = gen_garantia(cur, state, vend)
             man = gen_manutencao(cur, state, fleet)
 
