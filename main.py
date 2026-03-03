@@ -570,8 +570,8 @@ def build_metas_vendas(dim_tempo):
         metas.append({
             "meta_id": f"M{i:04d}",
             "ano_mes_id": r["ano_mes_id"],
-            "meta_quantidade": "2000",
-            "meta_valor": "500000",
+            "meta_quantidade": "1500", # Reduzido para ser batível
+            "meta_valor": "400000",
         })
     return metas
 
@@ -613,9 +613,11 @@ def desgaste_maquina(ano_fab: str, dt: datetime):
 def calc_oee(dur_h: float, ciclo_min: float, perf: float):
     minutos = dur_h * 60.0
     cap_max = int(minutos / ciclo_min)
-    qtd_plan = int(cap_max * 0.95)
+    
+    qtd_plan = int(cap_max * 0.85) 
 
-    eff = float(np.clip(np.random.normal(perf, 0.05), 0.0, 1.0))
+
+    eff = float(np.clip(np.random.normal(perf + 0.05, 0.04), 0.7, 1.1))
     qtd_prod = int(qtd_plan * eff)
 
     taxa_ref = 0.01 + (1.0 - perf)
