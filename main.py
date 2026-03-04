@@ -595,18 +595,31 @@ def gen_fleet(state: dict) -> list[dict]:
     state["fleet"] = fleet
     return fleet
 
-def desgaste_maquina(ano_fab: str, dt: datetime):
+def desgaste_maquina(ano_fab: str, dt: datetime, dias_para_falha: int = None):
     try:
         ano = int(ano_fab)
     except Exception:
         ano = 2021
 
     idade = max(0, dt.year - ano)
-    fator = 1.0 + idade * 0.03
-
-    temp = float(np.random.normal(65.0 * fator, 3.0))
-    vib = float(np.random.normal(1200.0 * fator, 150.0))
-    perf = max(0.85, 1.0 - idade * 0.01)
+    # Fator base de envelhecimento (realista)
+    fator_base = 1.0 + idade * 0.02 
+    
+    # --- LOGICA DE ASSINATURA DE FALHA (O PULO DO GATO) ---
+    incremento_falha = 1.0
+    variancia_extra = 1.0
+    
+    if dias_para_falha is not None:
+        if dias_para_falha == 0:   # Dia da quebra
+            incremento_falha = 1.45  # +45% de pico
+            variancia_extra = 3.0    # Vibração fica caótica
+        elif dias_para_falha <= 3: # 3 dias antes (O aviso que o modelo deve pegar)
+            incremento_falha = 1.20  # +20% (Sutil, mas o modelo nota)
+            variancia_extra = 1.8
+            
+    temp = float(np.random.normal(65.0 * fator_base * incremento_falha, 3.0 * variancia_extra))
+    vib = float(np.random.normal(1200.0 * fator_base * incremento_falha, 150.0 * variancia_extra))
+    perf = max(0.70, (1.0 - idade * 0.01) / incremento_falha)
 
     return round(temp, 1), round(vib, 0), perf
 
@@ -699,12 +712,14 @@ def gen_compras(dt: datetime, state: dict):
 
     return rows
 
-def gen_producao(dt: datetime, state: dict, fleet: list[dict]):
+def gen_producao(dt: datetime, state: dict, fleet: list[dict], falhas_programadas: dict = None):
     prod = []
     lotes = []
     qual = []
     alerts = []
-
+    
+    # Garante que não dê erro se vier vazio
+    falhas_programadas = falhas_programadas or {}
     produtos = [p["produto_id"] for p in DADOS_ESTATICOS["raw_produto"]]
 
     for m in fleet:
@@ -714,13 +729,19 @@ def gen_producao(dt: datetime, state: dict, fleet: list[dict]):
         op_id = f"OP{state['cnt_op']:07d}"
         lote_id = f"Lote{state['cnt_lote']:07d}"
 
-        temp, vib, perf = desgaste_maquina(m["ano"], dt)
+        # --- AQUI ESTÁ O SEGREDO DO TRIAL 7 ---
+        # Verificamos se esta máquina específica deve falhar
+        dias_aviso = falhas_programadas.get(m["maquina_id"], None)
+        
+        # Chamamos a função de desgaste com o novo parâmetro
+        temp, vib, perf = desgaste_maquina(m["ano"], dt, dias_para_falha=dias_aviso)
+        # --------------------------------------
 
         dur = round(random.uniform(0.80, 1.00), 2)
         fim = dt + timedelta(hours=dur)
-
         pid = random.choice(produtos)
         ciclo_nom = 0.5  # 30s
+        
         q_plan, q_prod, q_ref = calc_oee(dur, ciclo_nom, perf)
 
         lotes.append({
@@ -763,14 +784,15 @@ def gen_producao(dt: datetime, state: dict, fleet: list[dict]):
             "aprovado": "1" if q_prod > 0 else "0",
         })
 
+        # Alertas agora baseados no valor real (que pode estar inflado pela falha)
         if temp > 100.0 or vib > 2000.0:
             alerts.append({
                 "alerta_id": f"ALT-{uuid.uuid4().hex[:10]}",
-                "data_ocorrencia": dt,  # TIMESTAMP
+                "data_ocorrencia": dt,
                 "nivel": "CRITICO",
                 "maquina_id": m["maquina_id"],
-                "mensagem": "Anomalia Detectada",
-                "valor_medido": float(temp),
+                "mensagem": "Anomalia Detectada - Sensor Crítico",
+                "valor_medido": float(temp if temp > 100 else vib),
             })
 
     return prod, lotes, qual, alerts
@@ -1032,21 +1054,17 @@ def executar_simulacao(request):
             cli = gen_clientes(cur, state, passo_horas=24)
             comp = gen_compras(cur, state)
 
-            prod, lotes, qual, alt = gen_producao(cur, state, fleet)
-            mapa = gen_map_lote_compras(lotes, comp)
+            # --- NOVA LÓGICA DE FALHA PARA O TRIAL 7 (BACKFILL) ---
+            maquinas_em_falha = {}
+            # 10% de chance no passo diário para gerar um bom histórico de treino
+            if random.random() < 0.10: 
+                 maquina_sorteada = random.choice(fleet)["maquina_id"]
+                 maquinas_em_falha[maquina_sorteada] = random.randint(0, 3)
 
-            # --- INÍCIO DA SUBSTITUIÇÃO / AJUSTE PARA ML ---
-            if not alt and random.random() < 0.15:
-                m_random = random.choice(fleet)
-                alt.append({
-                    "alerta_id": f"ALT-HIST-{uuid.uuid4().hex[:6]}",
-                    "data_ocorrencia": cur,
-                    "nivel": "CRITICO",
-                    "maquina_id": m_random["maquina_id"],
-                    "mensagem": "Anomalia Histórica Injetada para Treino",
-                    "valor_medido": float(random.uniform(102.0, 115.0)) # Força valor acima do limite
-                })
-            # --- FIM DA SUBSTITUIÇÃO ---
+            # Passando as falhas programadas para a produção (ela mesma já vai gerar os alertas agora)
+            prod, lotes, qual, alt = gen_producao(cur, state, fleet, falhas_programadas=maquinas_em_falha)
+            
+            mapa = gen_map_lote_compras(lotes, comp)
 
             vend = gen_vendas(cur, state, lotes, prod)
             gar = gen_garantia(cur, state, vend)
@@ -1093,12 +1111,24 @@ def executar_simulacao(request):
         cli = gen_clientes(cur, state, passo_horas=1)
         comp = gen_compras(cur, state)
 
-        prod, lotes, qual, alt = gen_producao(cur, state, fleet)
+        # --- NOVA LÓGICA DE FALHA PARA O TRIAL 7 ---
+        # 1. Escolhemos 5% das máquinas para entrarem em regime de falha iminente
+        maquinas_em_falha = {}
+        if random.random() < 0.05: # Chance de haver alguma falha neste lote
+             maquina_sorteada = random.choice(fleet)["maquina_id"]
+             # Dias para a quebra: 0 (hoje), 1, 2 ou 3 dias de aviso
+             maquinas_em_falha[maquina_sorteada] = random.randint(0, 3)
+
+        # 2. Passamos esse dicionário para a função gen_producao
+        # (Você precisará ajustar a assinatura de gen_producao para receber esse parâmetro)
+        prod, lotes, qual, alt = gen_producao(cur, state, fleet, falhas_programadas=maquinas_em_falha)
+        
         mapa = gen_map_lote_compras(lotes, comp)
-
         vend = gen_vendas(cur, state, lotes, prod)
-
         gar = gen_garantia(cur, state, vend)
+        
+        # 3. Forçamos uma manutenção se a falha for "hoje" (dias=0) 
+        # para garantir que o modelo veja a correção depois
         man = gen_manutencao(cur, state, fleet)
 
         # persiste no GCS sempre; carrega no BQ só ano atual
