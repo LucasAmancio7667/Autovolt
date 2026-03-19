@@ -534,7 +534,7 @@ def gen_fleet(state: dict) -> list[dict]:
             "maquina_id": f"M{i:03d}",
             "tipo": random.choice(["Montadora", "Injetora", "Envasadora", "Robo", "Tester"]),
             "fabricante": random.choice(["Siemens", "Bosch", "ABB", "Kuka", "Engel"]),
-            "ano": str(random.choice[2019, 2020, 2021, 2022, 2023, 2024]),
+            "ano": str(random.choice([2019, 2020, 2021, 2022, 2023, 2024])),
             "linha_id": random.choice(["L01", "L02", "L03", "L04", "L05"]),
         })
 
