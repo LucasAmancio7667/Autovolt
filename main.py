@@ -485,14 +485,18 @@ def escolher_cliente_por_idade(state: dict) -> str:
     ult = state.get("ultimos_clientes", [])[-ULTIMOS_CLIENTES_JANELA:]
     if ult:
         freq = {}
-        for c in ult: freq[c] = freq.get(c, 0) + 1
+        for c in ult:
+            # GARANTIA: Se por erro o que estiver no histórico for uma lista/dict, ignoramos
+            if isinstance(c, (list, dict)): continue 
+            freq[c] = freq.get(c, 0) + 1
+        
         limite = max(3, int(0.12 * len(ult)))
 
         for _ in range(6):
             c = random.choices(clientes, weights=weights, k=1)
-            if freq.get(c, 0) <= limite: return c
-
-    return random.choices(clientes, weights=weights, k=1)
+            # Se o cliente for novo ou não estourou o limite, escolhemos ele
+            if freq.get(c, 0) <= limite: 
+                return c
 
 # -------------------------
 # STATIC BUILDERS
