@@ -373,12 +373,13 @@ def load_state(sc: storage.Client) -> dict:
     return state
 
 def save_state(sc: storage.Client, state: dict) -> None:
-    # Evita que o JSON de estado fique gigantesco durante o backfill
+    # Garante que o JSON de estado não exploda em tamanho (mantendo sincronismo recente)
     state["buffer_estoque"] = state["buffer_estoque"][-2000:]
     state["buffer_vendas"] = state["buffer_vendas"][-2000:]
     
     sc.bucket(BUCKET_NAME).blob(STATE_FILE).upload_from_string(
-        json.dumps(state, ensure_ascii=False, indent=2),
+        # O 'cls=CompactJSONEncoder' é o que ensina o JSON a ler datas/numpy
+        json.dumps(state, ensure_ascii=False, indent=2, cls=CompactJSONEncoder), 
         content_type="application/json",
     )
 
