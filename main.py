@@ -766,7 +766,7 @@ def gen_garantia(dt: datetime, state: dict):
         if data_reclamacao > dt.date():
             continue
 
-        defeito_id = random.choices(defeitos_ids, weights=defeitos_w, k=1)
+        defeito_id = random.choices(defeitos_ids, weights=defeitos_w, k=1)[0]
         dentro_garantia = dias <= GARANTIA_DIAS
 
         if defeito_id == "D00":
