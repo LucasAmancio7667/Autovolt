@@ -756,7 +756,11 @@ def gen_garantia(dt: datetime, state: dict):
         state["cnt_garantia"] += 1
         # Data da reclamação precisa ser DEPOIS da venda
         dias = random.randint(1, 90)
-        data_reclamacao = v["data_venda"] + timedelta(days=dias)
+        data_venda_obj = v["data_venda"]
+        if isinstance(data_venda_obj, str):
+            data_venda_obj = datetime.strptime(data_venda_obj, "%Y-%m-%d").date()
+            
+        data_reclamacao = data_venda_obj + timedelta(days=dias)
         
         # Ignora se tentou reclamar no "futuro" relativo ao loop
         if data_reclamacao > dt.date():
